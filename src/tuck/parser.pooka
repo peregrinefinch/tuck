@@ -1,0 +1,933 @@
+//// Reading the tags in order, and remembering which ones are still open.
+////
+//// A recursive-descent parser: each kind of tag has a function that reads
+//// it and everything up to its end tag, and expressions are read from the
+//// loosest operator (`or`) down to single values. Any mistake becomes a
+//// `TuckError` pointing at the token that did not fit.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module parser
+
+import pooka/json
+import pooka/list
+import pooka/string
+import tuck/ast.{
+  Block, Both, Branches, Compared, Document, Either, Expr, Extends, Field,
+  Filtered, Include, Item, Literal, Loop, Negated, Node, Print, Text, Variable, Call, Set, With
+}
+import tuck/error.{Pos, TuckError}
+import tuck/lexer.{
+  ClosePrint, CloseTag, Decimal, Integer, Lexeme, Name, OpenPrint, OpenTag, Str,
+  Symbol
+}
+
+/// The tags Tuck knows, for suggestions.
+_tags() -> List(String) {
+  [
+    "if",
+    "elif",
+    "else",
+    "endif",
+    "for",
+    "endfor",
+    "include",
+    "extends",
+    "block",
+    "endblock",
+    "set",
+    "with",
+    "endwith",
+    "raw",
+    "endraw"
+  ]
+}
+
+/// Read a template's lexemes into a document.
+///
+/// ```pooka
+/// import tuck/lexer
+/// import tuck/parser
+///
+/// let assert Ok(lexemes) = lexer.lex("page", "{% if ok %}yes{% endif %}")
+/// let assert Ok(document) = parser.parse("page", lexemes)
+/// assert document.extends == None
+/// ```
+parse(template: String, lexemes: List(Lexeme)) -> Result(Document, TuckError) {
+  let #(nodes, stop, _) = _nodes(template, lexemes, [], [])?
+  match stop {
+    Some(#(tag, at, _)) -> Error(TuckError(template, at, _stray(tag)))
+    None -> {
+      let document = _document(template, nodes)?
+      let _ = _unique_blocks(template, _block_names(document.nodes), [])?
+      Ok(document)
+    }
+  }
+}
+
+/// Separate `{% extends %}` from the nodes, and insist that an extending
+/// template holds nothing but blocks.
+_document(template: String, nodes: List(Node)) -> Result(Document, TuckError) {
+  let #(leading, rest) = list.split_while(nodes, _blank)
+  match rest {
+    [Extends(name, at), ..after] -> {
+      let _ = _only_blocks(template, after)?
+      let _ = _no_extends(template, after)?
+      Ok(Document(Some(#(name, at)), list.filter(after, fn(node: Node) {
+        !_blank(node)
+      })))
+    }
+    _ -> {
+      let _ = _no_extends(template, nodes)?
+      Ok(Document(None, list.concat(leading, rest)))
+    }
+  }
+}
+
+_blank(node: Node) -> Bool {
+  match node {
+    Text(value) -> string.trim(value) == ""
+    _ -> False
+  }
+}
+
+_only_blocks(template: String, nodes: List(Node)) -> Result(Nil, TuckError) {
+  list.try_each(nodes, fn(node: Node) {
+    match node {
+      Block(_, _, _) -> Ok(Nil)
+      _ if _blank(node) -> Ok(Nil)
+      Extends(_, at) -> Error(TuckError(
+        template,
+        at,
+        "a template can extend only one other template"
+      ))
+      other -> Error(TuckError(
+        template,
+        _where(other),
+        "a template that extends another may only contain blocks; put this inside a `{% block %}`"
+      ))
+    }
+  })
+}
+
+_no_extends(template: String, nodes: List(Node)) -> Result(Nil, TuckError) {
+  list.try_each(nodes, fn(node: Node) {
+    match node {
+      Extends(_, at) -> Error(TuckError(
+        template,
+        at,
+        "`{% extends %}` must come first in the template"
+      ))
+      Block(_, body, _) | With(_, body, _) -> _no_extends(template, body)
+      Loop(_, _, _, body, empty, _) -> {
+        let _ = _no_extends(template, body)?
+        _no_extends(template, empty)
+      }
+      Branches(choices, otherwise) -> {
+        let _ = list.try_each(choices, fn(choice) {
+          _no_extends(template, choice.1)
+        })?
+        _no_extends(template, otherwise)
+      }
+      _ -> Ok(Nil)
+    }
+  })
+}
+
+/// Where a node starts, as near as it is known.
+_where(node: Node) -> Pos {
+  match node {
+    Set(_, _, at) | With(_, _, at) | Print(_, at) | Loop(_, _, _, _, _, at) | Include(
+      _,
+      _,
+      _,
+      at
+    ) | Extends(_, at) | Block(
+      _,
+      _,
+      at
+    ) -> at
+    _ -> Pos(1, 1)
+  }
+}
+
+_stray(tag: String) -> String {
+  match tag {
+    "else" | "elif" -> "`" + tag + "` outside an `{% if %}` or `{% for %}`"
+    "endif" -> "`endif` without an open `{% if %}`"
+    "endfor" -> "`endfor` without an open `{% for %}`"
+    "endblock" -> "`endblock` without an open `{% block %}`"
+    "endwith" -> "`endwith` without an open `{% with %}`"
+    "endraw" -> "`endraw` without an open `{% raw %}`"
+    _ -> "unexpected `" + tag + "`"
+  }
+}
+
+// --- nodes ------------------------------------------------------------------------
+
+/// Nodes up to the end, or up to a tag named in `stops`. A stop comes back
+/// with its name, where it is, and the lexemes after its name.
+_nodes(
+  template: String,
+  rest: List(Lexeme),
+  stops: List(String),
+  acc: List(Node)
+) -> Result(
+  #(List(Node), Option(#(String, Pos, List(Lexeme))), List(Lexeme)),
+  TuckError
+) {
+  match rest {
+    [] -> Ok(#(list.reverse(acc), None, []))
+    [Lexeme(lexer.Text(value), _), ..after] -> _nodes(
+      template,
+      after,
+      stops,
+      list.prepend(acc, Text(value))
+    )
+    [Lexeme(OpenPrint(_), at), ..after] -> {
+      let #(value, after_value) = _expression(template, after)?
+      let after_close = _expect_close_print(template, after_value)?
+      _nodes(template, after_close, stops, list.prepend(acc, Print(value, at)))
+    }
+    [Lexeme(OpenTag(_), at), Lexeme(Name(tag), _), ..after] -> match list.contains(
+      stops,
+      tag
+    ) {
+      True -> Ok(#(list.reverse(acc), Some(#(tag, at, after)), after))
+      False -> {
+        let #(node, after_tag) = _tag(template, tag, at, after)?
+        _nodes(template, after_tag, stops, list.prepend(acc, node))
+      }
+    }
+    [Lexeme(OpenTag(_), at), ..] -> Error(TuckError(
+      template,
+      at,
+      "a tag starts with its name, such as `{% if … %}` or `{% for … %}`"
+    ))
+    [Lexeme(token, at), ..] -> Error(TuckError(
+      template,
+      at,
+      "unexpected " + _show(token)
+    ))
+  }
+}
+
+/// One tag and everything up to its end tag.
+_tag(
+  template: String,
+  tag: String,
+  at: Pos,
+  rest: List(Lexeme)
+) -> Result(#(Node, List(Lexeme)), TuckError) {
+  match tag {
+    "if" -> {
+      let #(condition, after) = _expression(template, rest)?
+      let after_close = _expect_close_tag(template, after, "if")?
+      _if(template, at, [], condition, after_close)
+    }
+    "for" -> _for(template, at, rest)
+    "include" -> _include(template, at, rest)
+    "set" -> {
+      let #(name, value, after) = _binding(template, rest)?
+      let after_close = _expect_close_tag(template, after, "set")?
+      Ok(#(Set(name, value, at), after_close))
+    }
+    "with" -> {
+      let #(bindings, after) = _bindings(template, rest, [])?
+      let after_close = _expect_close_tag(template, after, "with")?
+      let #(body, stop, _) = _nodes(template, after_close, ["endwith"], [])?
+      match stop {
+        None -> Error(
+          TuckError(
+            template,
+            at,
+            "this `{% with %}` is never closed with `{% endwith %}`"
+          )
+        )
+        Some(#(_, _, after_end)) -> {
+          let remaining = _expect_close_tag(template, after_end, "endwith")?
+          Ok(#(With(bindings, body, at), remaining))
+        }
+      }
+    }
+    "extends" -> {
+      let #(name, after) = _name_string(template, rest, "extends")?
+      let after_close = _expect_close_tag(template, after, "extends")?
+      Ok(#(Extends(name, at), after_close))
+    }
+    "block" -> _block(template, at, rest)
+    "else" | "elif" | "endif" | "endfor" | "endblock" | "endraw" | "endwith" -> Error(
+      TuckError(template, at, _stray(tag))
+    )
+    _ -> Error(TuckError(
+      template,
+      at,
+      "unknown tag `" + tag + "`" + error.suggest(tag, _tags())
+    ))
+  }
+}
+
+/// The rest of an `if`: the body of the current choice, then `elif`, `else`
+/// or `endif`.
+_if(
+  template: String,
+  opened: Pos,
+  choices: List(#(Expr, List(Node))),
+  condition: Expr,
+  rest: List(Lexeme)
+) -> Result(#(Node, List(Lexeme)), TuckError) {
+  let #(body, stop, _) = _nodes(template, rest, ["elif", "else", "endif"], [])?
+  let choices = list.prepend(choices, #(condition, body))
+  match stop {
+    None -> Error(TuckError(
+      template,
+      opened,
+      "this `{% if %}` is never closed with `{% endif %}`"
+    ))
+    Some(#("elif", _, after)) -> {
+      let #(next, after_condition) = _expression(template, after)?
+      let after_close = _expect_close_tag(template, after_condition, "elif")?
+      _if(template, opened, choices, next, after_close)
+    }
+    Some(#("else", _, after)) -> {
+      let after_close = _expect_close_tag(template, after, "else")?
+      let #(otherwise, end, _) = _nodes(template, after_close, ["endif"], [])?
+      match end {
+        Some(#(_, _, after_end)) -> {
+          let after_endif = _expect_close_tag(template, after_end, "endif")?
+          Ok(#(Branches(list.reverse(choices), otherwise), after_endif))
+        }
+        None -> Error(TuckError(
+          template,
+          opened,
+          "this `{% if %}` is never closed with `{% endif %}`"
+        ))
+      }
+    }
+    Some(#(_, _, after)) -> {
+      let after_endif = _expect_close_tag(template, after, "endif")?
+      Ok(#(Branches(list.reverse(choices), []), after_endif))
+    }
+  }
+}
+
+/// `for name in items` or `for key, name in object`, its body, an optional
+/// `else`, and `endfor`.
+_for(template: String, opened: Pos, rest: List(Lexeme)) -> Result(
+  #(Node, List(Lexeme)),
+  TuckError
+) {
+  let #(key, name, after_names) = match rest {
+    [
+      Lexeme(Name(first), _),
+      Lexeme(Symbol(","), _),
+      Lexeme(Name(second), _),
+      ..after
+    ] -> Ok(#(Some(first), second, after))
+    [Lexeme(Name(only), _), ..after] -> Ok(#(None, only, after))
+    [Lexeme(token, at), ..] -> Error(TuckError(
+      template,
+      at,
+      "`for` needs a name for each item, as in `{% for post in posts %}`, not " + _show(
+        token
+      )
+    ))
+    [] -> Error(TuckError(template, opened, "`for` is missing its name"))
+  }?
+  let _ = _loop_names(template, opened, key, name)?
+  let after_in = match after_names {
+    [Lexeme(Name("in"), _), ..after] -> Ok(after)
+    [Lexeme(token, at), ..] -> Error(TuckError(
+      template,
+      at,
+      "expected `in` after the loop's name, found " + _show(token)
+    ))
+    [] -> Error(TuckError(template, opened, "`for` is missing `in`"))
+  }?
+  let #(items, after_items) = _expression(template, after_in)?
+  let after_close = _expect_close_tag(template, after_items, "for")?
+  let #(body, stop, _) = _nodes(template, after_close, ["else", "endfor"], [])?
+  let never_closed = TuckError(
+    template,
+    opened,
+    "this `{% for %}` is never closed with `{% endfor %}`"
+  )
+  match stop {
+    None -> Error(never_closed)
+    Some(#("else", _, after)) -> {
+      let after_else = _expect_close_tag(template, after, "else")?
+      let #(empty, end, _) = _nodes(template, after_else, ["endfor"], [])?
+      match end {
+        Some(#(_, _, after_end)) -> {
+          let after_endfor = _expect_close_tag(template, after_end, "endfor")?
+          Ok(#(Loop(key, name, items, body, empty, opened), after_endfor))
+        }
+        None -> Error(never_closed)
+      }
+    }
+    Some(#(_, _, after)) -> {
+      let after_endfor = _expect_close_tag(template, after, "endfor")?
+      Ok(#(Loop(key, name, items, body, [], opened), after_endfor))
+    }
+  }
+}
+
+/// `block name`, its body, and `endblock`, optionally repeating the name.
+_block(template: String, opened: Pos, rest: List(Lexeme)) -> Result(
+  #(Node, List(Lexeme)),
+  TuckError
+) {
+  let #(name, after_name) = match rest {
+    [Lexeme(Name(name), _), ..after] -> Ok(#(name, after))
+    [Lexeme(token, at), ..] -> Error(TuckError(
+      template,
+      at,
+      "`block` needs a name, as in `{% block content %}`, not " + _show(token)
+    ))
+    [] -> Error(TuckError(template, opened, "`block` is missing its name"))
+  }?
+  let after_close = _expect_close_tag(template, after_name, "block")?
+  let #(body, stop, _) = _nodes(template, after_close, ["endblock"], [])?
+  match stop {
+    None -> Error(TuckError(
+      template,
+      opened,
+      "this `{% block " + name + " %}` is never closed with `{% endblock %}`"
+    ))
+    Some(#(_, _, after)) -> {
+      let after_repeat = match after {
+        [Lexeme(Name(again), _), ..later] if again == name -> Ok(later)
+        [Lexeme(Name(other), at), ..] -> Error(TuckError(
+          template,
+          at,
+          "`endblock " + other + "` closes `block " + name + "`"
+        ))
+        _ -> Ok(after)
+      }?
+      let after_endblock = _expect_close_tag(template, after_repeat, "endblock")?
+      Ok(#(Block(name, body, opened), after_endblock))
+    }
+  }
+}
+
+/// The quoted name after `include` or `extends`.
+_name_string(template: String, rest: List(Lexeme), tag: String) -> Result(
+  #(String, List(Lexeme)),
+  TuckError
+) {
+  match rest {
+    [Lexeme(Str(name), _), ..after] -> Ok(#(name, after))
+    [Lexeme(token, at), ..] -> Error(TuckError(
+      template,
+      at,
+      "`" + tag + "` needs a template name in quotes, as in `{% " + tag + " \"partials/header.tuck\" %}`, not " + _show(
+        token
+      )
+    ))
+    [] -> Error(
+      TuckError(template, Pos(1, 1), "`" + tag + "` is missing its name")
+    )
+  }
+}
+
+_expect_close_tag(template: String, rest: List(Lexeme), tag: String) -> Result(
+  List(Lexeme),
+  TuckError
+) {
+  match rest {
+    [Lexeme(CloseTag(_), _), ..after] -> Ok(after)
+    [Lexeme(token, at), ..] -> Error(TuckError(
+      template,
+      at,
+      "expected `%}` to end `" + tag + "`, found " + _show(token)
+    ))
+    [] -> Error(
+      TuckError(template, Pos(1, 1), "expected `%}` to end `" + tag + "`")
+    )
+  }
+}
+
+_expect_close_print(template: String, rest: List(Lexeme)) -> Result(
+  List(Lexeme),
+  TuckError
+) {
+  match rest {
+    [Lexeme(ClosePrint(_), _), ..after] -> Ok(after)
+    [Lexeme(token, at), ..] -> Error(TuckError(
+      template,
+      at,
+      "expected `}}` after the value, found " + _show(token)
+    ))
+    [] -> Error(TuckError(template, Pos(1, 1), "expected `}}` after the value"))
+  }
+}
+
+// --- expressions ------------------------------------------------------------------
+
+/// A whole expression: `or` binds loosest.
+_expression(template: String, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  let #(left, after) = _and(template, rest)?
+  _or_more(template, left, after)
+}
+
+_or_more(template: String, left: Expr, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  match rest {
+    [Lexeme(Name("or"), _), ..after] -> {
+      let #(right, after_right) = _and(template, after)?
+      _or_more(template, Either(left, right), after_right)
+    }
+    _ -> Ok(#(left, rest))
+  }
+}
+
+_and(template: String, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  let #(left, after) = _not(template, rest)?
+  _and_more(template, left, after)
+}
+
+_and_more(template: String, left: Expr, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  match rest {
+    [Lexeme(Name("and"), _), ..after] -> {
+      let #(right, after_right) = _not(template, after)?
+      _and_more(template, Both(left, right), after_right)
+    }
+    _ -> Ok(#(left, rest))
+  }
+}
+
+_not(template: String, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  match rest {
+    [Lexeme(Name("not"), _), ..after] -> {
+      let #(operand, after_operand) = _not(template, after)?
+      Ok(#(Negated(operand), after_operand))
+    }
+    _ -> _comparison(template, rest)
+  }
+}
+
+_comparison(template: String, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  let #(left, after) = _filtered(template, rest)?
+  match after {
+    [Lexeme(Symbol(op), at), ..later] if list.contains(
+      ["==", "!=", "<", "<=", ">", ">="],
+      op
+    ) -> {
+      let #(right, after_right) = _filtered(template, later)?
+      Ok(#(Compared(op, left, right, at), after_right))
+    }
+    [Lexeme(Name("in"), at), ..later] -> {
+      let #(right, after_right) = _filtered(template, later)?
+      Ok(#(Compared("in", left, right, at), after_right))
+    }
+    [Lexeme(Symbol("="), at), ..] -> Error(TuckError(
+      template,
+      at,
+      "`=` is not a comparison; use `==`"
+    ))
+    _ -> Ok(#(left, after))
+  }
+}
+
+/// A value followed by any number of `| filter` or `| filter(arguments)`.
+_filtered(template: String, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  let #(value, after) = _postfix(template, rest)?
+  _filters(template, value, after)
+}
+
+_filters(template: String, value: Expr, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  match rest {
+    [
+      Lexeme(Symbol("|"), _),
+      Lexeme(Name(name), at),
+      Lexeme(Symbol("("), _),
+      ..after
+    ] -> {
+      let #(arguments, after_arguments) = _arguments(template, after, [])?
+      _filters(template, Filtered(value, name, arguments, at), after_arguments)
+    }
+    [Lexeme(Symbol("|"), _), Lexeme(Name(name), at), ..after] -> _filters(
+      template,
+      Filtered(value, name, [], at),
+      after
+    )
+    [Lexeme(Symbol("|"), at), ..] -> Error(TuckError(
+      template,
+      at,
+      "`|` must be followed by a filter's name, as in `| upper`"
+    ))
+    _ -> Ok(#(value, rest))
+  }
+}
+
+/// Filter arguments, after the `(`, up to and including the `)`.
+_arguments(template: String, rest: List(Lexeme), acc: List(Expr)) -> Result(
+  #(List(Expr), List(Lexeme)),
+  TuckError
+) {
+  _arguments_with(template, rest, acc, "filter")
+}
+
+_arguments_with(
+  template: String,
+  rest: List(Lexeme),
+  acc: List(Expr),
+  kind: String
+) -> Result(
+  #(List(Expr), List(Lexeme)),
+  TuckError
+) {
+  match rest {
+    [Lexeme(Symbol(")"), _), ..after] -> Ok(#(list.reverse(acc), after))
+    _ -> {
+      let #(argument, after) = _expression(template, rest)?
+      match after {
+        [Lexeme(Symbol(","), _), ..later] -> _arguments_with(
+          template,
+          later,
+          list.prepend(acc, argument),
+          kind
+        )
+        [Lexeme(Symbol(")"), _), ..later] -> Ok(#(
+          list.reverse(list.prepend(acc, argument)),
+          later
+        ))
+        [Lexeme(token, at), ..] -> Error(TuckError(
+          template,
+          at,
+          "expected `,` or `)` in the " + kind + "'s arguments, found " + _show(
+            token
+          )
+        ))
+        [] -> Error(
+          TuckError(template, Pos(1, 1), "unclosed " + kind + " arguments")
+        )
+      }
+    }
+  }
+}
+
+/// A value followed by any number of `.field` or `[key]`.
+_postfix(template: String, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  let #(value, after) = _primary(template, rest)?
+  _access(template, value, after)
+}
+
+_access(template: String, value: Expr, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  match rest {
+    [Lexeme(Symbol("("), at), ..after] -> match _function_path(value) {
+      None -> Error(
+        TuckError(template, at, "only registered function names can be called")
+      )
+      Some(#(name, opened)) -> {
+        let #(arguments, remaining) = _arguments_with(
+          template,
+          after,
+          [],
+          "function"
+        )?
+        _access(template, Call(name, arguments, opened), remaining)
+      }
+    }
+    [Lexeme(Symbol("."), _), Lexeme(Name(name), at), ..after] -> _access(
+      template,
+      Field(value, name, at),
+      after
+    )
+    [Lexeme(Symbol("."), at), ..] -> Error(TuckError(
+      template,
+      at,
+      "`.` must be followed by a field name, as in `user.name`"
+    ))
+    [Lexeme(Symbol("["), at), ..after] -> {
+      let #(key, after_key) = _expression(template, after)?
+      match after_key {
+        [Lexeme(Symbol("]"), _), ..later] -> _access(
+          template,
+          Item(value, key, at),
+          later
+        )
+        [Lexeme(token, found), ..] -> Error(TuckError(
+          template,
+          found,
+          "expected `]`, found " + _show(token)
+        ))
+        [] -> Error(TuckError(template, at, "this `[` is never closed"))
+      }
+    }
+    _ -> Ok(#(value, rest))
+  }
+}
+
+_primary(template: String, rest: List(Lexeme)) -> Result(
+  #(Expr, List(Lexeme)),
+  TuckError
+) {
+  match rest {
+    [Lexeme(Str(value), _), ..after] -> Ok(
+      #(Literal(json.JString(value)), after)
+    )
+    [Lexeme(Integer(value), _), ..after] -> Ok(
+      #(Literal(json.JInt(value)), after)
+    )
+    [Lexeme(Decimal(value), _), ..after] -> Ok(#(
+      Literal(json.JFloat(value)),
+      after
+    ))
+    [Lexeme(Name("true"), _), ..after] -> Ok(
+      #(Literal(json.JBool(True)), after)
+    )
+    [Lexeme(Name("false"), _), ..after] -> Ok(#(
+      Literal(json.JBool(False)),
+      after
+    ))
+    [Lexeme(Name("nil"), _), ..after] | [Lexeme(Name("null"), _), ..after] -> Ok(
+      #(
+        Literal(json.JNull()),
+        after
+      )
+    )
+    [Lexeme(Name(name), at), ..after] -> Ok(#(Variable(name, at), after))
+    [Lexeme(Symbol("("), at), ..after] -> {
+      let #(inner, after_inner) = _expression(template, after)?
+      match after_inner {
+        [Lexeme(Symbol(")"), _), ..later] -> Ok(#(inner, later))
+        [Lexeme(token, found), ..] -> Error(TuckError(
+          template,
+          found,
+          "expected `)`, found " + _show(token)
+        ))
+        [] -> Error(TuckError(template, at, "this `(` is never closed"))
+      }
+    }
+    [Lexeme(token, at), ..] -> Error(TuckError(
+      template,
+      at,
+      "expected a value, found " + _show(token)
+    ))
+    [] -> Error(TuckError(template, Pos(1, 1), "expected a value"))
+  }
+}
+
+/// A token as a reader would name it.
+_show(token: lexer.Token) -> String {
+  match token {
+    lexer.Text(_) -> "text"
+    OpenPrint(_) -> "`{{`"
+    ClosePrint(_) -> "`}}`"
+    OpenTag(_) -> "`{%`"
+    CloseTag(_) -> "`%}`"
+    Name(name) -> "`" + name + "`"
+    Str(value) -> "the string \"" + value + "\""
+    Integer(_) | Decimal(_) -> "a number"
+    Symbol(symbol) -> "`" + symbol + "`"
+  }
+}
+
+// Block names describe one inheritance surface, even when the declarations sit
+// inside branches. Repeating a name is ambiguous, so report its second address.
+_block_names(nodes: List(Node)) -> List(#(String, Pos)) {
+  list.flat_map(nodes, fn(node) {
+    match node {
+      Block(name, body, at) -> [#(name, at), .._block_names(body)]
+      With(_, body, _) -> _block_names(body)
+      Branches(choices, otherwise) -> list.concat(
+        list.flat_map(choices, fn(choice) { _block_names(choice.1) }),
+        _block_names(otherwise)
+      )
+      Loop(_, _, _, body, empty, _) -> list.concat(
+        _block_names(body),
+        _block_names(empty)
+      )
+      _ -> []
+    }
+  })
+}
+
+_unique_blocks(
+  template: String,
+  names: List(#(String, Pos)),
+  seen: List(String)
+) -> Result(Nil, TuckError) {
+  match names {
+    [] -> Ok(Nil)
+    [#(name, at), ..rest] -> match list.contains(seen, name) {
+      True -> Error(
+        TuckError(
+          template,
+          at,
+          "block `" + name + "` is declared more than once; give each block its own name"
+        )
+      )
+      False -> _unique_blocks(template, rest, [name, ..seen])
+    }
+  }
+}
+
+_loop_names(template: String, at: Pos, key: Option(String), name: String) -> Result(
+  Nil,
+  TuckError
+) {
+  let names = match key {
+    Some(key) -> [key, name]
+    None -> [name]
+  }
+  match key == Some(name) {
+    True -> Error(
+      TuckError(template, at, "a loop's key and value need different names")
+    )
+    False -> list.try_fold(names, Nil, fn(_unit, name) {
+      match name {
+        "loop" -> Error(
+          TuckError(
+            template,
+            at,
+            "`loop` is reserved for loop metadata; choose another loop variable"
+          )
+        )
+        _ if list.contains(
+          ["true", "false", "nil", "null", "and", "or", "not", "in"],
+          name
+        ) -> Error(
+          TuckError(
+            template,
+            at,
+            "`" + name + "` is reserved by the template language; choose another loop variable"
+          )
+        )
+        _ -> Ok(Nil)
+      }
+    })
+  }
+}
+
+_function_path(value: Expr) -> Option(#(String, Pos)) {
+  match value {
+    Variable(name, at) -> Some(#(name, at))
+    Field(parent, name, _) -> match _function_path(parent) {
+      Some(#(prefix, at)) -> Some(#(prefix + "." + name, at))
+      None -> None
+    }
+    _ -> None
+  }
+}
+
+_binding(template: String, tokens: List(Lexeme)) -> Result(
+  #(String, Expr, List(Lexeme)),
+  TuckError
+) {
+  match tokens {
+    [Lexeme(Name(name), at), Lexeme(Symbol("="), _), ..rest] -> {
+      let _ = _binding_name(template, at, name)?
+      let #(value, after) = _expression(template, rest)?
+      Ok(#(name, value, after))
+    }
+    [Lexeme(_, at), .._rest] -> Error(
+      TuckError(template, at, "expected a binding such as `title = page.title`")
+    )
+    [] -> Error(
+      TuckError(
+        template,
+        Pos(1, 1),
+        "expected a binding such as `title = page.title`"
+      )
+    )
+  }
+}
+
+_binding_name(template: String, at: Pos, name: String) -> Result(Nil, TuckError) {
+  match list.contains(
+    ["loop", "true", "false", "nil", "null", "and", "or", "not", "in"],
+    name
+  ) {
+    True -> Error(
+      TuckError(
+        template,
+        at,
+        "`" + name + "` is reserved; choose another binding name"
+      )
+    )
+    False -> Ok(Nil)
+  }
+}
+
+_bindings(
+  template: String,
+  tokens: List(Lexeme),
+  reversed: List(#(String, Expr))
+) -> Result(#(List(#(String, Expr)), List(Lexeme)), TuckError) {
+  let #(name, value, after) = _binding(template, tokens)?
+  match list.key_find(reversed, name) {
+    Some(_) -> Error(
+      TuckError(
+        template,
+        _where_binding(tokens),
+        "binding `" + name + "` is supplied more than once"
+      )
+    )
+    None -> {
+      let accumulated = [#(name, value), ..reversed]
+      match after {
+        [Lexeme(Symbol(","), _), ..rest] -> _bindings(
+          template,
+          rest,
+          accumulated
+        )
+        _ -> Ok(#(list.reverse(accumulated), after))
+      }
+    }
+  }
+}
+
+_where_binding(tokens: List(Lexeme)) -> Pos {
+  match tokens {
+    [Lexeme(_, at), .._rest] -> at
+    [] -> Pos(1, 1)
+  }
+}
+
+_include(template: String, at: Pos, tokens: List(Lexeme)) -> Result(
+  #(Node, List(Lexeme)),
+  TuckError
+) {
+  let #(name, after_name) = _name_string(template, tokens, "include")?
+  let #(bindings, after) = match after_name {
+    [Lexeme(Name("with"), _), ..rest] -> _bindings(template, rest, [])
+    _ -> Ok(#([], after_name))
+  }?
+  let #(only, after_only) = match after {
+    [Lexeme(Name("only"), _), ..rest] -> #(True, rest)
+    _ -> #(False, after)
+  }
+  let remaining = _expect_close_tag(template, after_only, "include")?
+  Ok(#(Include(name, bindings, only, at), remaining))
+}

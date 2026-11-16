@@ -1,0 +1,94 @@
+//// A template, understood: the shape the parser builds and the renderer
+//// walks.
+////
+//// A template is a list of nodes: text, values to print, and the tags that
+//// choose, repeat or borrow other templates. Inside tags live expressions:
+//// names, paths into them, literals, comparisons and filters.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module ast
+
+import pooka/json.{Json}
+import tuck/error.{Pos}
+
+/// A value to compute.
+class Expr {}
+
+/// A value written in the template: a string, a number, `true`, `false` or
+/// `nil`.
+class Literal(value: Json) is Expr
+
+/// A name looked up in the data, or a loop variable: `user`.
+class Variable(name: String, at: Pos) is Expr
+
+/// A field of an object: `user.name`.
+class Field(target: Expr, name: String, at: Pos) is Expr
+
+/// A list position or an object key: `posts[0]`, `scores["ada"]`.
+class Item(target: Expr, key: Expr, at: Pos) is Expr
+
+/// A value passed through a filter: `name | upper`, `items | join(", ")`.
+class Filtered(target: Expr, name: String, arguments: List(Expr), at: Pos) is Expr
+
+/// `not value`
+class Negated(operand: Expr) is Expr
+
+/// `left and right`
+class Both(left: Expr, right: Expr) is Expr
+
+/// `left or right`
+class Either(left: Expr, right: Expr) is Expr
+
+/// `==`, `!=`, `<`, `<=`, `>`, `>=` or `in`.
+class Compared(operator: String, left: Expr, right: Expr, at: Pos) is Expr
+
+/// A part of a template.
+class Node {}
+
+/// Text, printed as it is.
+class Text(value: String) is Node
+
+/// `{{ value }}`
+class Print(value: Expr, at: Pos) is Node
+
+/// `{% if %}`, any `{% elif %}`s, and an optional `{% else %}`.
+class Branches(choices: List(#(Expr, List(Node))), otherwise: List(Node)) is Node
+
+/// `{% for name in items %}` or `{% for key, name in object %}`, with an
+/// optional `{% else %}` for when there is nothing to repeat.
+class Loop(
+  key: Option(String),
+  name: String,
+  items: Expr,
+  body: List(Node),
+  empty: List(Node),
+  at: Pos
+) is Node
+
+/// `{% include "name" %}`
+class Include(
+  name: String,
+  bindings: List(#(String, Expr)),
+  only: Bool,
+  at: Pos
+) is Node
+
+/// `{% block name %} … {% endblock %}`
+class Block(name: String, body: List(Node), at: Pos) is Node
+
+/// `{% extends "name" %}` while it is being read. A finished `Document`
+/// holds it as `extends` instead.
+class Extends(name: String, at: Pos) is Node
+
+/// A whole template: the template it extends, if any, and its nodes.
+class Document(extends: Option(#(String, Pos)), nodes: List(Node))
+
+/// An explicit registered call, including a dotted namespace such as time.now.
+class Call(name: String, arguments: List(Expr), at: Pos) is Expr
+
+/// Bind a name for following nodes in the current lexical scope.
+class Set(name: String, value: Expr, at: Pos) is Node
+
+/// A lexical scope whose bindings are evaluated in the enclosing scope.
+class With(bindings: List(#(String, Expr)), body: List(Node), at: Pos) is Node

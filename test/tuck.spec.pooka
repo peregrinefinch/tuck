@@ -1,0 +1,607 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Tuck from the outside: templates in, text or a helpful error out.
+
+module tuck_test
+
+import poke/fixture
+import poke/generator
+import poke/property
+import poke/should
+import pooka/file
+import pooka/json.{JArray, JBool, JInt, JObject, JString, Json}
+import pooka/list
+import pooka/path
+import pooka/string
+import tuck.{Library}
+import tuck/error
+
+/// Data written as JSON, for brevity.
+_data(text: String) -> Json {
+  should.be_ok(json.decode(text))
+}
+
+/// Render text as a template (escaping for HTML) and expect it to work.
+_html(source: String, data: String) -> String {
+  should.be_ok(tuck.render(should.be_ok(tuck.parse(source)), _data(data)))
+}
+
+/// Render text as a plain template and expect it to work.
+_plain(source: String, data: String) -> String {
+  let template = should.be_ok(tuck.parse_named("t", source, tuck.Escape.Plain))
+  should.be_ok(tuck.render(template, _data(data)))
+}
+
+/// The one-line description of whatever goes wrong, reading or rendering.
+_problem(source: String, data: String) -> String {
+  match tuck.parse(source) {
+    Error(problem) -> tuck.describe(problem)
+    Ok(template) -> tuck.describe(
+      should.be_error(tuck.render(template, _data(data)))
+    )
+  }
+}
+
+_library(templates: List(#(String, String))) -> Library {
+  should.be_ok(list.try_fold(
+    templates,
+    tuck.library(),
+    fn(
+      found: Library,
+      entry: #(String, String)
+    ) {
+      tuck.add(found, entry.0, entry.1)
+    }
+  ))
+}
+
+// --- values -------------------------------------------------------------------------
+
+test "values, fields, items and literals" {
+  let data = "{\"user\": {\"name\": \"Ada\", \"age\": 36}, \"tags\": [\"owl\", \"moon\"], \"pi\": 3.5, \"ok\": true, \"none\": null}"
+  should.equal(_html("Hi {{ user.name }}, {{ user.age }}", data), "Hi Ada, 36")
+  should.equal(
+    _html("{{ tags[0] }} {{ tags[-1] }} {{ user[\"name\"] }}", data),
+    "owl moon Ada"
+  )
+  should.equal(_html("{{ pi }} {{ ok }} [{{ none }}]", data), "3.5 true []")
+  should.equal(
+    _html("{{ \"text\" }} {{ 42 }} {{ -1.5 }} {{ true }}", "{}"),
+    "text 42 -1.5 true"
+  )
+}
+
+test "HTML templates escape what they print, plain ones do not" {
+  let data = "{\"name\": \"<b>Tom & 'Jerry'</b>\"}"
+  should.equal(
+    _html("{{ name }}", data),
+    "&lt;b&gt;Tom &amp; &#39;Jerry&#39;&lt;/b&gt;"
+  )
+  should.equal(_plain("{{ name }}", data), "<b>Tom & 'Jerry'</b>")
+  should.equal(_html("{{ name | safe }}", data), "<b>Tom & 'Jerry'</b>")
+  should.equal(
+    _plain("{{ name | escape }}", data),
+    "&lt;b&gt;Tom &amp; &#39;Jerry&#39;&lt;/b&gt;"
+  )
+  should.equal(
+    _html("{{ name | escape }}", data),
+    "&lt;b&gt;Tom &amp; &#39;Jerry&#39;&lt;/b&gt;"
+  )
+}
+
+test "property: escaped HTML never contains a tag" {
+  let pieces = generator.strings(["<", ">", "&", "\"", "'", "a", " ", "é"], 30)
+  property.for_all(pieces, fn(text: String) {
+    let printed = _html(
+      "{{ value }}",
+      json.encode(JObject([#("value", JString(text))]))
+    )
+    should.be_false(string.contains(printed, "<"))
+    should.be_false(string.contains(printed, ">"))
+  })
+}
+
+// --- conditions ----------------------------------------------------------------------
+
+test "if, elif and else" {
+  let source = "{% if n > 10 %}big{% elif n > 0 %}small{% else %}none{% endif %}"
+  should.equal(_html(source, "{\"n\": 20}"), "big")
+  should.equal(_html(source, "{\"n\": 3}"), "small")
+  should.equal(_html(source, "{\"n\": 0}"), "none")
+}
+
+test "truth, and, or, not, comparisons and in" {
+  let data = "{\"empty\": \"\", \"list\": [1, 2], \"user\": {\"admin\": false, \"name\": \"Ada\"}}"
+  should.equal(
+    _html("{% if empty %}a{% endif %}{% if list %}b{% endif %}", data),
+    "b"
+  )
+  should.equal(
+    _html("{% if not user.admin and user.name %}c{% endif %}", data),
+    "c"
+  )
+  should.equal(_html("{% if user.admin or 2 in list %}d{% endif %}", data), "d")
+  should.equal(_html("{% if \"da\" in user.name %}e{% endif %}", data), "e")
+  should.equal(_html("{% if \"name\" in user %}f{% endif %}", data), "f")
+  should.equal(
+    _html("{% if 1 == 1.0 and \"a\" < \"b\" and 2 >= 2 %}g{% endif %}", data),
+    "g"
+  )
+  should.equal(
+    _html("{% if user.missing %}no{% else %}h{% endif %}", data),
+    "h"
+  )
+}
+
+// --- loops ---------------------------------------------------------------------------
+
+test "for, with the loop variable" {
+  let source = "{% for n in names %}{{ loop.index }}:{{ n }}{% if not loop.last %}, {% endif %}{% endfor %}"
+  should.equal(
+    _html(source, "{\"names\": [\"Ada\", \"Bo\", \"Cy\"]}"),
+    "1:Ada, 2:Bo, 3:Cy"
+  )
+  should.equal(
+    _html(
+      "{% for n in ns %}{{ loop.index0 }}{{ loop.first }}{{ loop.length }};{% endfor %}",
+      "{\"ns\": [1, 2]}"
+    ),
+    "0true2;1false2;"
+  )
+}
+
+test "for else, nil, and objects with two names" {
+  should.equal(
+    _html("{% for n in ns %}x{% else %}empty{% endfor %}", "{\"ns\": []}"),
+    "empty"
+  )
+  should.equal(
+    _html("{% for n in ns %}x{% else %}empty{% endfor %}", "{\"ns\": null}"),
+    "empty"
+  )
+  should.equal(
+    _html(
+      "{% for key, value in scores %}{{ key }}={{ value }} {% endfor %}",
+      "{\"scores\": {\"ada\": 3, \"bo\": 5}}"
+    ),
+    "ada=3 bo=5 "
+  )
+}
+
+test "nested loops see their own and outer names" {
+  let source = "{% for row in rows %}{% for cell in row.cells %}{{ row.name }}{{ cell }}{% endfor %};{% endfor %}"
+  should.equal(
+    _html(
+      source,
+      "{\"rows\": [{\"name\": \"a\", \"cells\": [1, 2]}, {\"name\": \"b\", \"cells\": [3]}]}"
+    ),
+    "a1a2;b3;"
+  )
+}
+
+// --- filters -------------------------------------------------------------------------
+
+test "text filters" {
+  let data = "{\"s\": \"  hello world  \", \"long\": \"a lantern in the night library\"}"
+  should.equal(_html("{{ s | trim | upper }}", data), "HELLO WORLD")
+  should.equal(_html("{{ s | trim | capitalize }}", data), "Hello world")
+  should.equal(_html("{{ \"MiXeD\" | lower }}", data), "mixed")
+  should.equal(_html("{{ long | truncate(9) }}", data), "a lantern…")
+  should.equal(_html("{{ long | truncate(9, \"...\") }}", data), "a lantern...")
+  should.equal(
+    _html("{{ long | replace(\"night\", \"day\") }}", data),
+    "a lantern in the day library"
+  )
+  should.equal(
+    _html(
+      "{{ \"abc\" | reverse }}{{ \"abc\" | first }}{{ \"abc\" | last }}",
+      data
+    ),
+    "cbaac"
+  )
+}
+
+test "list filters" {
+  let data = "{\"names\": [\"Cy\", \"Ada\", \"Bo\"], \"ns\": [3, 1.5, 2], \"user\": {\"a\": 1}}"
+  should.equal(_html("{{ names | join(\", \") }}", data), "Cy, Ada, Bo")
+  should.equal(_html("{{ names | sort | join }}", data), "AdaBoCy")
+  should.equal(_html("{{ ns | sort | join(\" \") }}", data), "1.5 2 3")
+  should.equal(
+    _html("{{ names | first }} {{ names | last }} {{ names | length }}", data),
+    "Cy Bo 3"
+  )
+  should.equal(_html("{{ names | reverse | join }}", data), "BoAdaCy")
+  should.equal(_html("{{ user | json | safe }}", data), "{\"a\":1}")
+  should.equal(
+    _html("{% if names | length > 2 %}many{% endif %}", data),
+    "many"
+  )
+}
+
+test "default replaces what is missing or nil, and nothing else" {
+  let data = "{\"name\": \"Ada\", \"none\": null, \"empty\": \"\"}"
+  should.equal(_html("{{ nickname | default(\"friend\") }}", data), "friend")
+  should.equal(_html("{{ none | default(\"friend\") }}", data), "friend")
+  should.equal(_html("{{ name | default(\"friend\") }}", data), "Ada")
+  should.equal(_html("[{{ empty | default(\"friend\") }}]", data), "[]")
+  should.equal(_html("{{ user.name | default(\"guest\") }}", data), "guest")
+}
+
+test "filters of your own" {
+  let shout = fn(value: Json, _arguments: List(Json)) {
+    match value {
+      JString(s) -> Ok(JString(string.uppercase(s) + "!"))
+      _ -> Error("`shout` needs text")
+    }
+  }
+  let pages = _library([#("a.txt.tuck", "{{ name | shout }}")])
+  |> tuck.with_filter("shout", shout)
+  should.equal(
+    tuck.render_named(pages, "a.txt.tuck", _data("{\"name\": \"hi\"}")),
+    Ok("HI!")
+  )
+  should.equal(
+    tuck.describe(
+      should.be_error(
+        tuck.render_named(pages, "a.txt.tuck", _data("{\"name\": 1}"))
+      )
+    ),
+    "a.txt.tuck:1:11: `shout` needs text"
+  )
+}
+
+// --- text, comments, raw, whitespace -------------------------------------------------
+
+test "comments vanish, raw blocks stay as written" {
+  should.equal(_html("a{# a note #}b", "{}"), "ab")
+  should.equal(
+    _html("{% raw %}{{ not a value }} {% if %}{% endraw %}", "{}"),
+    "{{ not a value }} {% if %}"
+  )
+}
+
+test "a dash trims whitespace on its side" {
+  let source = "<ul>\n  {%- for n in ns %}\n  <li>{{ n }}</li>\n  {%- endfor %}\n</ul>"
+  should.equal(
+    _html(source, "{\"ns\": [1, 2]}"),
+    "<ul>\n  <li>1</li>\n  <li>2</li>\n</ul>"
+  )
+  should.equal(_html("a  {{- \"b\" -}}  c", "{}"), "abc")
+  should.equal(_html("x {%- raw -%}  y  {%- endraw -%} z", "{}"), "xyz")
+}
+
+// --- errors ------------------------------------------------------------------------
+
+test "unknown names and fields say what there is" {
+  should.equal(
+    _problem("{{ nmae }}", "{\"name\": 1}"),
+    "template:1:4: `nmae` is not defined; did you mean `name`?"
+  )
+  should.equal(
+    _problem("{{ user.emial }}", "{\"user\": {\"email\": \"a\"}}"),
+    "template:1:9: `user` has no field `emial`; did you mean `email`?"
+  )
+  should.equal(
+    _problem("{{ name | uppr }}", "{\"name\": \"a\"}"),
+    "template:1:11: unknown filter `uppr`; did you mean `upper`?"
+  )
+  should.equal(
+    _problem("{% fro x in y %}", "{}"),
+    "template:1:1: unknown tag `fro`; did you mean `for`?"
+  )
+}
+
+test "values that cannot be printed or looped explain themselves" {
+  should.equal(
+    _problem("{{ tags }}", "{\"tags\": [1]}"),
+    "template:1:1: `tags` is a list; a list cannot be printed as it is; loop over it with `{% for %}`, or use `| join(\", \")`"
+  )
+  should.equal(
+    _problem("{% for x in user %}{% endfor %}", "{\"user\": {\"a\": 1}}"),
+    "template:1:1: `user` is an object; loop over its fields with two names, as in `{% for key, value in user %}`"
+  )
+  should.equal(
+    _problem("{{ name.first }}", "{\"name\": \"Ada\"}"),
+    "template:1:9: `name` is a string, not an object, so it has no field `first`"
+  )
+  should.equal(
+    _problem("{% if a < \"b\" %}{% endif %}", "{\"a\": 1}"),
+    "template:1:9: cannot compare a number with a string"
+  )
+}
+
+test "broken templates say where" {
+  should.equal(
+    _problem("line one\n{% if x %}", "{}"),
+    "template:2:1: this `{% if %}` is never closed with `{% endif %}`"
+  )
+  should.equal(
+    _problem("{% endif %}", "{}"),
+    "template:1:1: `endif` without an open `{% if %}`"
+  )
+  should.equal(
+    _problem("{{ a b }}", "{}"),
+    "template:1:6: expected `}}` after the value, found `b`"
+  )
+  should.equal(
+    _problem("{{ name", "{}"),
+    "template:1:8: this tag is never closed with `}}`"
+  )
+  should.equal(
+    _problem("{% if a = 1 %}{% endif %}", "{}"),
+    "template:1:9: `=` is not a comparison; use `==`"
+  )
+  should.equal(
+    _problem("{{ \"open }}", "{}"),
+    "template:1:4: this string is never closed with \""
+  )
+  should.equal(
+    _problem("x {# never closed", "{}"),
+    "template:1:3: this comment is never closed with `#}`"
+  )
+}
+
+test "the data must be an object" {
+  should.equal(
+    tuck.describe(
+      should.be_error(tuck.render(should.be_ok(tuck.parse("x")), JArray([])))
+    ),
+    "template:1:1: the data must be an object, so its fields can be named; this is a list"
+  )
+}
+
+// --- libraries ----------------------------------------------------------------------
+
+test "includes share the names around them" {
+  let pages = _library([
+    #("item.html.tuck", "<li>{{ loop.index }}. {{ post.title }}</li>"),
+    #(
+      "list.html.tuck",
+      "<ul>{% for post in posts %}{% include \"item.html.tuck\" %}{% endfor %}</ul>"
+    )
+  ])
+  should.equal(
+    tuck.render_named(
+      pages,
+      "list.html.tuck",
+      _data("{\"posts\": [{\"title\": \"Owls\"}, {\"title\": \"<Moths>\"}]}")
+    ),
+    Ok("<ul><li>1. Owls</li><li>2. &lt;Moths&gt;</li></ul>")
+  )
+}
+
+test "templates extend templates, and the nearest block wins" {
+  let pages = _library([
+    #(
+      "base.html.tuck",
+      "<title>{% block title %}Site{% endblock %}</title><main>{% block body %}{% block intro %}hello{% endblock %}{% endblock %}</main>"
+    ),
+    #(
+      "section.html.tuck",
+      "{% extends \"base.html.tuck\" %}\n{% block title %}Section{% endblock %}\n{% block intro %}welcome{% endblock %}"
+    ),
+    #(
+      "page.html.tuck",
+      "{% extends \"section.html.tuck\" %}{% block title %}{{ name }}{% endblock title %}"
+    )
+  ])
+  let data = _data("{\"name\": \"Page\"}")
+  should.equal(
+    tuck.render_named(pages, "base.html.tuck", data),
+    Ok("<title>Site</title><main>hello</main>")
+  )
+  should.equal(
+    tuck.render_named(pages, "section.html.tuck", data),
+    Ok("<title>Section</title><main>welcome</main>")
+  )
+  should.equal(
+    tuck.render_named(pages, "page.html.tuck", data),
+    Ok("<title>Page</title><main>welcome</main>")
+  )
+}
+
+test "extending templates hold only blocks, and extends comes first" {
+  should.equal(
+    _problem("{% extends \"base\" %}\nstray text", "{}"),
+    "template:1:1: a template that extends another may only contain blocks; put this inside a `{% block %}`"
+  )
+  should.equal(
+    _problem("hello {% extends \"base\" %}", "{}"),
+    "template:1:7: `{% extends %}` must come first in the template"
+  )
+}
+
+test "circles of includes or extends are caught" {
+  let pages = _library([
+    #("a.tuck", "{% include \"b.tuck\" %}"),
+    #("b.tuck", "{% include \"a.tuck\" %}"),
+    #("c.tuck", "{% extends \"d.tuck\" %}"),
+    #("d.tuck", "{% extends \"c.tuck\" %}")
+  ])
+  should.contain_text(
+    tuck.describe(
+      should.be_error(tuck.render_named(pages, "a.tuck", _data("{}")))
+    ),
+    "in a circle"
+  )
+  should.contain_text(
+    tuck.describe(
+      should.be_error(tuck.render_named(pages, "c.tuck", _data("{}")))
+    ),
+    "in a circle"
+  )
+}
+
+test "a missing template is named, with a suggestion" {
+  let pages = _library(
+    [#("header.tuck", "h"), #("page.tuck", "{% include \"heder.tuck\" %}")]
+  )
+  should.equal(
+    tuck.describe(
+      should.be_error(tuck.render_named(pages, "page.tuck", _data("{}")))
+    ),
+    "page.tuck:1:1: there is no template called `heder.tuck`; did you mean `header.tuck`?"
+  )
+  should.equal(
+    tuck.describe(
+      should.be_error(tuck.render_named(pages, "pag.tuck", _data("{}")))
+    ),
+    "pag.tuck:1:1: there is no template called `pag.tuck`; did you mean `page.tuck`?"
+  )
+}
+
+test "a template on its own cannot include others" {
+  should.contain_text(
+    _problem("{% include \"x.tuck\" %}", "{}"),
+    "a template rendered on its own cannot include or extend others"
+  )
+}
+
+test "escaping follows the template's name" {
+  should.equal(tuck.escape_for("pages/home.html.tuck"), tuck.Escape.Html)
+  should.equal(tuck.escape_for("feed.xml.tuck"), tuck.Escape.Html)
+  should.equal(tuck.escape_for("emails/welcome.txt.tuck"), tuck.Escape.Plain)
+  should.equal(tuck.escape_for("README.md.tuck"), tuck.Escape.Plain)
+  let pages = _library(
+    [#("a.txt.tuck", "{{ x }}"), #("a.html.tuck", "{{ x }}")]
+  )
+  let data = _data("{\"x\": \"<&>\"}")
+  should.equal(tuck.render_named(pages, "a.txt.tuck", data), Ok("<&>"))
+  should.equal(
+    tuck.render_named(pages, "a.html.tuck", data),
+    Ok("&lt;&amp;&gt;")
+  )
+}
+
+test "a folder of templates becomes a library" {
+  fixture.with_directory(fn(directory: String) {
+    let _ = should.be_ok(
+      file.create_directories(path.join([directory, "layouts"]))
+    )
+    let _ = should.be_ok(file.write(
+      path.join([directory, "layouts", "base.html.tuck"]),
+      "<h1>{% block title %}{% endblock %}</h1>"
+    ))
+    let _ = should.be_ok(file.write(
+      path.join([directory, "home.html.tuck"]),
+      "{% extends \"layouts/base.html.tuck\" %}{% block title %}{{ title }}{% endblock %}"
+    ))
+    let _ = should.be_ok(
+      file.write(path.join([directory, "notes.txt"]), "not a template")
+    )
+    let pages = should.be_ok(tuck.load(directory))
+    should.equal(
+      list.map(pages.templates, fn(entry: #(String, tuck.Template)) { entry.0 }),
+      ["home.html.tuck", "layouts/base.html.tuck"]
+    )
+    should.equal(
+      tuck.render_named(
+        pages,
+        "home.html.tuck",
+        JObject([#("title", JString("Home & away"))])
+      ),
+      Ok("<h1>Home &amp; away</h1>")
+    )
+  })
+}
+
+test "reading a broken file in a folder names the file" {
+  fixture.with_directory(fn(directory: String) {
+    let _ = should.be_ok(
+      file.write(path.join([directory, "bad.tuck"]), "\n\n{% for %}")
+    )
+    should.equal(
+      tuck.describe(should.be_error(tuck.load(directory))),
+      "bad.tuck:3:8: `for` needs a name for each item, as in `{% for post in posts %}`, not `%}`"
+    )
+  })
+}
+
+test "a whole page" {
+  let pages = _library([
+    #(
+      "base.html.tuck",
+      "<!doctype html>\n<title>{% block title %}{% endblock %}</title>\n{% block body %}{% endblock %}\n"
+    ),
+    #(
+      "posts.html.tuck",
+      "{% extends \"base.html.tuck\" %}\n{% block title %}{{ site | upper }}{% endblock %}\n{% block body %}\n<ul>\n  {%- for post in posts %}\n  <li{% if post.draft %} class=\"draft\"{% endif %}>{{ post.title | truncate(12) }}</li>\n  {%- else %}\n  <li>Nothing yet.</li>\n  {%- endfor %}\n</ul>\n{% endblock %}"
+    )
+  ])
+  let data = _data(
+    "{\"site\": \"owls\", \"posts\": [{\"title\": \"Night flights over the moor\", \"draft\": false}, {\"title\": \"Pellets\", \"draft\": true}]}"
+  )
+  should.equal(
+    tuck.render_named(pages, "posts.html.tuck", data),
+    Ok(
+      "<!doctype html>\n<title>OWLS</title>\n\n<ul>\n  <li>Night flight…</li>\n  <li class=\"draft\">Pellets</li>\n</ul>\n\n"
+    )
+  )
+}
+
+test "bools and numbers come from the data as they are" {
+  let data = JObject([#("on", JBool(True)), #("count", JInt(3))])
+  should.equal(
+    tuck.render(should.be_ok(tuck.parse("{{ on }}/{{ count }}")), data),
+    Ok("true/3")
+  )
+}
+
+test "edit distances, with swapped neighbours counting once" {
+  should.equal(error.distance("kitten", "sitting"), 3)
+  should.equal(error.distance("fro", "for"), 1)
+  should.equal(error.distance("", "abc"), 3)
+  should.equal(error.distance("same", "same"), 0)
+  should.equal(
+    error.suggest("endfro", ["endfor", "endif"]),
+    "; did you mean `endfor`?"
+  )
+  should.equal(error.suggest("zzz", ["upper"]), "")
+}
+
+// --- the documentation's own examples ----------------------------------------------------
+
+test "the examples in tuck's documentation" {
+  let page = should.be_ok(tuck.parse("Hello, {{ name }}!"))
+  should.equal(
+    tuck.render(page, JObject([#("name", JString("Ada"))])),
+    Ok("Hello, Ada!")
+  )
+
+  should.equal(
+    tuck.describe(should.be_error(tuck.parse("{% if %}"))),
+    "template:1:7: expected a value, found `%}`"
+  )
+
+  let names = should.be_ok(
+    tuck.parse("{% for n in names %}{{ n }};{% endfor %}")
+  )
+  let data = JObject([#("names", JArray([JString("Ada"), JString("Bo")]))])
+  should.equal(tuck.render(names, data), Ok("Ada;Bo;"))
+
+  let pages = should.be_ok(
+    tuck.library()
+    |> tuck.add("base.html.tuck", "<main>{% block body %}{% endblock %}</main>")
+  )
+  let pages = should.be_ok(
+    pages
+    |> tuck.add(
+      "home.html.tuck",
+      "{% extends \"base.html.tuck\" %}{% block body %}Hi, {{ name }}{% endblock %}"
+    )
+  )
+  should.equal(
+    tuck.render_named(
+      pages,
+      "home.html.tuck",
+      JObject([#("name", JString("<Ada>"))])
+    ),
+    Ok("<main>Hi, &lt;Ada&gt;</main>")
+  )
+  should.equal(
+    error.describe(
+      error.TuckError("page.tuck", error.Pos(3, 7), "something is wrong")
+    ),
+    "page.tuck:3:7: something is wrong"
+  )
+}

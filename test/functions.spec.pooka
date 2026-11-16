@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module functions_test
+
+import tuck
+import tuck/limits
+import pooka/json.{JInt, JObject, JString, Json}
+import pooka/list
+import poke/should
+import poke/process
+import pooka/time
+
+_clock(args: List(Json)) -> Result(Json, String) {
+  match args {
+    [] -> Ok(
+      JObject(
+        [#("year", JInt(2026)), #("iso", JString("2026-11-16T12:00:00Z"))]
+      )
+    )
+    _ -> Error("expected no arguments")
+  }
+}
+
+_pages(source: String) -> tuck.Library {
+  let pages = tuck.library() |> tuck.add("page.html.tuck", source) |> should.be_ok()
+  pages |> tuck.with_function("time.now", _clock) |> should.be_ok()
+}
+
+test "namespaced functions return values accessible with ordinary field syntax" {
+  let pages = _pages("{{ time.now().year }}|{{ time.now().iso }}")
+  should.equal(
+    tuck.render_named(pages, "page.html.tuck", JObject([])),
+    Ok("2026|2026-11-16T12:00:00Z")
+  )
+}
+
+test "callbacks receive typed arguments from expressions and nested calls" {
+  let pages = _pages("{{ strings.greet(time.now().year, page.name) }}")
+  let pages = pages |> tuck.with_function("strings.greet", fn(args) {
+    match args {
+      [JInt(2026), JString(name)] -> Ok(JString("Hello " + name))
+      _ -> Error("expected year and name")
+    }
+  }) |> should.be_ok()
+  should.equal(
+    tuck.render_named(
+      pages,
+      "page.html.tuck",
+      JObject([#("page", JObject([#("name", JString("<Owl>"))]))])
+    ),
+    Ok("Hello &lt;Owl&gt;")
+  )
+}
+
+test "functions do not bypass HTML escaping" {
+  let pages = _pages("{{ markup.text() }}") |> tuck.with_function(
+    "markup.text",
+    fn(_args) { Ok(JString("<b>owl</b>")) }
+  ) |> should.be_ok()
+  should.equal(
+    tuck.render_named(pages, "page.html.tuck", JObject([])),
+    Ok("&lt;b&gt;owl&lt;/b&gt;")
+  )
+}
+
+test "function errors retain their call location and namespace" {
+  let pages = _pages("Hello\n{{ time.now(1) }}")
+  let error = tuck.render_named(pages, "page.html.tuck", JObject([])) |> should.be_error()
+  should.equal(error.at.line, 2)
+  should.equal(error.message, "`time.now`: expected no arguments")
+}
+
+test "unknown functions suggest registered names" {
+  let pages = _pages("{{ time.nwo() }}")
+  let error = tuck.render_named(pages, "page.html.tuck", JObject([])) |> should.be_error()
+  should.contain_text(error.message, "did you mean `time.now`?")
+}
+
+test "invalid or reserved registrations return errors" {
+  list.each(
+    ["", "time..now", ".now", "9now", "super", "not.now", "true"],
+    fn(name) {
+      tuck.with_function(tuck.library(), name, _clock) |> should.be_error()
+      Nil
+    }
+  )
+}
+
+test "registration replaces the same function without mutating older libraries" {
+  let original = _pages("{{ time.now().year }}")
+  let changed = original |> tuck.with_function("time.now", fn(_args) {
+    Ok(JObject([#("year", JInt(2030))]))
+  }) |> should.be_ok()
+  should.equal(
+    tuck.render_named(original, "page.html.tuck", JObject([])),
+    Ok("2026")
+  )
+  should.equal(
+    tuck.render_named(changed, "page.html.tuck", JObject([])),
+    Ok("2030")
+  )
+}
+
+test "JSON data does not acquire arbitrary callable methods" {
+  tuck.parse("{{ page[\"name\"]() }}") |> should.be_error()
+  tuck.parse("{{ time.now().year() }}") |> should.be_error()
+  Nil
+}
+
+test "site and page params remain ordinary host supplied objects" {
+  let pages = _pages(
+    "{{ site.params.author }}|{{ page.params.description }}|{{ time.now().year }}"
+  )
+  let data = JObject(
+    [
+      #(
+        "site",
+        JObject([#("params", JObject([#("author", JString("Finch"))]))])
+      ),
+      #(
+        "page",
+        JObject(
+          [#("params", JObject([#("description", JString("A visitor"))]))]
+        )
+      )
+    ]
+  )
+  should.equal(
+    tuck.render_named(pages, "page.html.tuck", data),
+    Ok("Finch|A visitor|2026")
+  )
+}
+
+test "checked rendering also bounds registered functions" {
+  let pages = _pages("{{ host.slow() }}") |> tuck.with_function(
+    "host.slow",
+    fn(_args) {
+      time.sleep(time.milliseconds(100)) |> should.be_ok()
+      Ok(JString("late"))
+    }
+  ) |> should.be_ok()
+  let result = process.within(2000, fn() {
+    tuck.render_named_checked(
+      pages,
+      "page.html.tuck",
+      JObject([]),
+      limits.Budget(1000, 1000, 1000000, 100000, 10)
+    )
+  }) |> should.be_ok()
+  should.contain_text(
+    (result |> should.be_error()).message,
+    "elapsed-time budget"
+  )
+}
+
+test "short circuit conditions and present defaults do not call unused functions" {
+  let channel = process.channel()
+  let pages = _pages(
+    "{% if false and host.touch() %}bad{% endif %}{{ name | default(host.touch()) }}"
+  )
+  let pages = pages |> tuck.with_function("host.touch", fn(_args) {
+    channel.send(True)
+    Ok(JString("touched"))
+  }) |> should.be_ok()
+  should.equal(
+    tuck.render_named(
+      pages,
+      "page.html.tuck",
+      JObject([#("name", JString("Owl"))])
+    ),
+    Ok("Owl")
+  )
+  channel.receive(0) |> should.be_error()
+  Nil
+}
+
+test "set can snapshot a function result for repeated use" {
+  let channel = process.channel()
+  let pages = _pages(
+    "{% set current = host.clock() %}{{ current }}|{{ current }}"
+  )
+  let pages = pages |> tuck.with_function("host.clock", fn(_args) {
+    channel.send(True)
+    Ok(JString("fixed"))
+  }) |> should.be_ok()
+  should.equal(
+    tuck.render_named(pages, "page.html.tuck", JObject([])),
+    Ok("fixed|fixed")
+  )
+  should.equal(channel.expect(100), True)
+  channel.receive(0) |> should.be_error()
+  Nil
+}

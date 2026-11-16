@@ -1,0 +1,897 @@
+//// Walking a template with the data in hand, and writing as it goes.
+////
+//// Values are looked up in the loop variables first, then in the data.
+//// A name that is not there is not an error straight away: `{% if %}` reads
+//// it as false and `| default` replaces it. Only printing it, looping over
+//// it or filtering it is an error, and then the message says what was
+//// missing and what was there instead.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module render
+
+import pooka/int
+import pooka/json.{JArray, JBool, JInt, JNull, JObject, JString, Json}
+import pooka/list
+import pooka/order.{Order}
+import pooka/string
+import pooka/string_tree.{StringTree}
+import tuck/ast.{
+  Block, Both, Branches, Compared, Document, Either, Expr, Extends, Field,
+  Filtered, Include, Item, Literal, Loop, Negated, Node, Print, Text, Variable, Call, Set, With
+}
+import tuck/error.{Pos, TuckError}
+import tuck/filter.{Filter}
+import tuck/function.{Function}
+
+/// A value while it is being worked out.
+class Val {}
+
+/// A value from the template or the data.
+class Found(value: Json) is Val
+
+/// Text that is already safe to print without escaping.
+class Safe(text: String) is Val
+
+/// Something that is not there: the sentence to say if it matters, and
+/// where in the template it was asked for.
+class Missing(message: String, at: Pos) is Val
+
+/// Everything rendering needs to know besides the nodes themselves.
+class Version(owner: String, body: List(Node))
+
+class Scope(
+  template: String,
+  load: fn(String) -> Result(Document, TuckError),
+  filters: List(#(String, Filter)),
+  functions: List(#(String, Function)),
+  escape: Bool,
+  frames: List(List(#(String, Val))),
+  data: List(#(String, Json)),
+  blocks: List(#(String, List(Version))),
+  stack: List(String),
+  parents: List(Version)
+)
+
+/// Render the template called `name`, with `data` as its values.
+///
+/// `load` finds a template's document by name, for this template and for
+/// anything it includes or extends. `escape` makes every printed value safe
+/// for HTML.
+document(
+  name: String,
+  load: fn(String) -> Result(Document, TuckError),
+  filters: List(#(String, Filter)),
+  functions: List(#(String, Function)),
+  escape: Bool,
+  data: List(#(String, Json))
+) -> Result(String, TuckError) {
+  let known = list.concat(filters, filter.built_in())
+  let scope = Scope(name, load, known, functions, escape, [], data, [], [], [])
+  let tree = _document(scope, name, Pos(1, 1))?
+  Ok(string_tree.to_string(tree))
+}
+
+// --- documents, includes and inheritance ------------------------------------------
+
+/// Render a whole document, following `extends` to the template at the top
+/// and filling its blocks from the templates below.
+_document(scope: Scope, name: String, at: Pos) -> Result(StringTree, TuckError) {
+  let chain = _chain(scope, name, at, [])?
+  // Keep every version nearest-first. The selected block sees its parent
+  // versions through super(), while each nested block owns its own chain.
+  let blocks = list.fold(chain, scope.blocks, fn(found, link) {
+    list.fold(_blocks(link.1.nodes), found, fn(known, block) {
+      let versions = match list.key_find(known, block.0) {
+        Some(existing) -> existing
+        None -> []
+      }
+      let updated = list.append(versions, Version(link.0, block.1))
+      list.prepend(
+        list.filter(known, fn(entry) { entry.0 != block.0 }),
+        #(block.0, updated)
+      )
+    })
+  })
+  let top = match list.last(chain) {
+    Some(link) -> link
+    None -> #(name, Document(None, []))
+  }
+  _nodes(
+    _entered(
+      scope,
+      top.0,
+      blocks,
+      list.concat(
+        list.map(chain, fn(link: #(String, Document)) { link.0 }),
+        scope.stack
+      )
+    ),
+    top.1.nodes,
+    string_tree.new()
+  )
+}
+
+/// The template and every template it extends, nearest first.
+_chain(
+  scope: Scope,
+  name: String,
+  at: Pos,
+  seen: List(String)
+) -> Result(List(#(String, Document)), TuckError) {
+  match list.contains(seen, name) || list.contains(scope.stack, name) {
+    True -> Error(TuckError(
+      scope.template,
+      at,
+      "templates include or extend each other in a circle: " + string.join(
+        list.reverse(
+          list.prepend(
+            list.concat(seen, list.reverse(scope.stack)) |> list.reverse,
+            name
+          )
+        ),
+        " → "
+      )
+    ))
+    False -> {
+      // Library templates are read before rendering starts, so a template
+      // that cannot be loaded now is simply not there: the problem belongs
+      // to the tag that asked for it.
+      let found = match scope.load(name) {
+        Ok(document) -> Ok(document)
+        Error(problem) -> Error(TuckError(scope.template, at, problem.message))
+      }?
+      match found.extends {
+        None -> Ok([#(name, found)])
+        Some(#(parent, parent_at)) -> {
+          let above = _chain(
+            _in(scope, name),
+            parent,
+            parent_at,
+            list.append(seen, name)
+          )?
+          Ok(list.prepend(above, #(name, found)))
+        }
+      }
+    }
+  }
+}
+
+/// Every block in the nodes, nested ones included.
+_blocks(nodes: List(Node)) -> List(#(String, List(Node))) {
+  list.flat_map(nodes, fn(node: Node) {
+    match node {
+      Block(name, body, _) -> list.prepend(_blocks(body), #(name, body))
+      With(_, body, _) -> _blocks(body)
+      Branches(choices, otherwise) -> list.concat(
+        list.flat_map(choices, fn(choice: #(Expr, List(Node))) {
+          _blocks(choice.1)
+        }),
+        _blocks(otherwise)
+      )
+      Loop(_, _, _, body, empty, _) -> list.concat(
+        _blocks(body),
+        _blocks(empty)
+      )
+      _ -> []
+    }
+  })
+}
+
+/// The same scope, rendering another template's nodes.
+_in(scope: Scope, template: String) -> Scope {
+  Scope(
+    template,
+    scope.load,
+    scope.filters,
+    scope.functions,
+    scope.escape,
+    scope.frames,
+    scope.data,
+    scope.blocks,
+    scope.stack,
+    scope.parents
+  )
+}
+
+_entered(
+  scope: Scope,
+  template: String,
+  blocks: List(#(String, List(Version))),
+  stack: List(String)
+) -> Scope {
+  Scope(
+    template,
+    scope.load,
+    scope.filters,
+    scope.functions,
+    scope.escape,
+    scope.frames,
+    scope.data,
+    blocks,
+    stack,
+    []
+  )
+}
+
+_with_frame(scope: Scope, frame: List(#(String, Json))) -> Scope {
+  let values = list.map(frame, fn(entry) { #(entry.0, Found(entry.1)) })
+  _with_values(scope, values)
+}
+
+_with_values(scope: Scope, frame: List(#(String, Val))) -> Scope {
+  Scope(
+    scope.template,
+    scope.load,
+    scope.filters,
+    scope.functions,
+    scope.escape,
+    [frame, ..scope.frames],
+    scope.data,
+    scope.blocks,
+    scope.stack,
+    scope.parents
+  )
+}
+
+_with_parent(scope: Scope, owner: String, parents: List(Version)) -> Scope {
+  Scope(
+    owner,
+    scope.load,
+    scope.filters,
+    scope.functions,
+    scope.escape,
+    scope.frames,
+    scope.data,
+    scope.blocks,
+    scope.stack,
+    parents
+  )
+}
+
+_assign(scope: Scope, name: String, value: Val) -> Scope {
+  let #(frame, remaining) = match scope.frames {
+    [first, ..rest] -> #(first, rest)
+    [] -> #([], [])
+  }
+  let frame = [#(name, value), ..list.filter(frame, fn(entry) {
+    entry.0 != name
+  })]
+  Scope(
+    scope.template,
+    scope.load,
+    scope.filters,
+    scope.functions,
+    scope.escape,
+    [frame, ..remaining],
+    scope.data,
+    scope.blocks,
+    scope.stack,
+    scope.parents
+  )
+}
+
+// --- nodes ---------------------------------------------------------------------------
+
+_nodes(scope: Scope, nodes: List(Node), out: StringTree) -> Result(
+  StringTree,
+  TuckError
+) {
+  match nodes {
+    [] -> Ok(out)
+    [Set(name, expression, at), ..rest] -> {
+      let value = _assigned_value(scope, expression, at)?
+      _nodes(_assign(scope, name, value), rest, out)
+    }
+    [node, ..rest] -> {
+      let written = _node(scope, node, out)?
+      _nodes(scope, rest, written)
+    }
+  }
+}
+
+_node(scope: Scope, node: Node, out: StringTree) -> Result(
+  StringTree,
+  TuckError
+) {
+  match node {
+    Text(value) -> Ok(string_tree.append(out, value))
+    Print(value, at) -> {
+      let found = _eval(scope, value)?
+      let printed = match found {
+        Found(v) -> match filter.text(v) {
+          Ok(s) -> Ok(_escaped(scope, s))
+          Error(reason) -> Error(
+            TuckError(
+              scope.template,
+              at,
+              _path(value) + " is " + filter.kind(v) + "; " + reason
+            )
+          )
+        }
+        Safe(s) -> Ok(s)
+        Missing(message, where) -> Error(
+          TuckError(scope.template, where, message)
+        )
+      }?
+      Ok(string_tree.append(out, printed))
+    }
+    Branches(choices, otherwise) -> _branches(scope, choices, otherwise, out)
+    Loop(key, name, items, body, empty, at) -> _loop(
+      scope,
+      key,
+      name,
+      items,
+      body,
+      empty,
+      at,
+      out
+    )
+    Include(name, arguments, only, at) -> {
+      let bindings = _bindings(scope, arguments, at)?
+      let base = match only {
+        True -> Scope(
+          scope.template,
+          scope.load,
+          scope.filters,
+          scope.functions,
+          scope.escape,
+          [],
+          [],
+          [],
+          scope.stack,
+          []
+        )
+        False -> _entered(scope, scope.template, [], scope.stack)
+      }
+      let own = _with_values(base, bindings)
+      let included = _document(own, name, at)?
+      Ok(string_tree.append_tree(out, included))
+    }
+    With(arguments, body, at) -> {
+      let bindings = _bindings(scope, arguments, at)?
+      _nodes(_with_values(scope, bindings), body, out)
+    }
+    Set(_, _, _) -> Ok(out)
+    Block(name, body, _) -> match list.key_find(scope.blocks, name) {
+      Some([chosen, ..parents]) -> _nodes(
+        _with_parent(scope, chosen.owner, parents),
+        chosen.body,
+        out
+      )
+      _ -> _nodes(_with_parent(scope, scope.template, []), body, out)
+    }
+    Extends(_, _) -> Ok(out)
+  }
+}
+
+_escaped(scope: Scope, text: String) -> String {
+  match scope.escape {
+    True -> filter.escape_html(text)
+    False -> text
+  }
+}
+
+_branches(
+  scope: Scope,
+  choices: List(#(Expr, List(Node))),
+  otherwise: List(Node),
+  out: StringTree
+) -> Result(StringTree, TuckError) {
+  match choices {
+    [] -> _nodes(scope, otherwise, out)
+    [#(condition, body), ..rest] -> {
+      let value = _eval(scope, condition)?
+      match _truthy(value) {
+        True -> _nodes(scope, body, out)
+        False -> _branches(scope, rest, otherwise, out)
+      }
+    }
+  }
+}
+
+_loop(
+  scope: Scope,
+  key: Option(String),
+  name: String,
+  items: Expr,
+  body: List(Node),
+  empty: List(Node),
+  at: Pos,
+  out: StringTree
+) -> Result(StringTree, TuckError) {
+  let value = _eval(scope, items)?
+  let rows = match #(value, key) {
+    #(Found(JArray(list_items)), None) -> Ok(
+      list.map(list_items, fn(item: Json) {
+        [#(name, item)]
+      })
+    )
+    #(Found(JArray(_)), Some(_)) -> Error(#(
+      _path(items) + " is a list; loop over it with one name, as in `{% for item in " + _spelling(
+        items
+      ) + " %}`",
+      at
+    ))
+    #(Found(JObject(entries)), Some(key_name)) -> Ok(list.map(
+      entries,
+      fn(
+        entry: #(String, Json)
+      ) {
+        [#(key_name, JString(entry.0)), #(name, entry.1)]
+      }
+    ))
+    #(Found(JObject(_)), None) -> Error(#(
+      _path(items) + " is an object; loop over its fields with two names, as in `{% for key, value in " + _spelling(
+        items
+      ) + " %}`",
+      at
+    ))
+    #(Found(JNull), _) -> Ok([])
+    #(Found(other), _) -> Error(#(
+      "cannot loop over " + _path(items) + ", which is " + filter.kind(other),
+      at
+    ))
+    #(Safe(_), _) -> Error(#("cannot loop over text", at))
+    #(Missing(message, where), _) -> Error(#(message, where))
+  }
+  match rows {
+    Error(#(message, where)) -> Error(TuckError(scope.template, where, message))
+    Ok([]) -> _nodes(scope, empty, out)
+    Ok(all) -> {
+      let length = list.length(all)
+      list.index_fold(
+        all,
+        Ok(out),
+        fn(
+          acc: Result(StringTree, TuckError),
+          row: List(#(String, Json)),
+          index: Int
+        ) {
+          let written = acc?
+          let frame = list.append(
+            row,
+            #("loop", _loop_info(index, length, _parent_loop(scope)))
+          )
+          _nodes(_with_frame(scope, frame), body, written)
+        }
+      )
+    }
+  }
+}
+
+/// `loop.index` (from one), `loop.index0` (from zero), `loop.first`,
+/// `loop.last` and `loop.length`.
+_loop_info(index: Int, length: Int, parent: Json) -> Json {
+  JObject([
+    #("index", JInt(index + 1)),
+    #("index0", JInt(index)),
+    #("first", JBool(index == 0)),
+    #("last", JBool(index == length - 1)),
+    #("length", JInt(length)),
+    #("revindex", JInt(length - index)),
+    #("revindex0", JInt(length - index - 1)),
+    #("parent", parent)
+  ])
+}
+
+// --- expressions -----------------------------------------------------------------------
+
+_eval(scope: Scope, expr: Expr) -> Result(Val, TuckError) {
+  match expr {
+    Call(name, arguments, at) -> _call(scope, name, arguments, at)
+    Literal(value) -> Ok(Found(value))
+    Variable(name, at) -> Ok(_lookup(scope, name, at))
+    Field(target, name, at) -> {
+      let base = _eval(scope, target)?
+      match base {
+        Found(JObject(entries)) -> match list.key_find(entries, name) {
+          Some(found) -> Ok(Found(found))
+          None -> Ok(Missing(
+            _path(target) + " has no field `" + name + "`" + error.suggest(
+              name,
+              list.map(entries, fn(entry: #(String, Json)) { entry.0 })
+            ),
+            at
+          ))
+        }
+        Found(JNull) -> Ok(
+          Missing(
+            _path(target) + " is nil, so it has no field `" + name + "`",
+            at
+          )
+        )
+        Found(other) -> Error(TuckError(
+          scope.template,
+          at,
+          _path(target) + " is " + filter.kind(other) + ", not an object, so it has no field `" + name + "`"
+        ))
+        Safe(_) -> Error(
+          TuckError(scope.template, at, "text has no field `" + name + "`")
+        )
+        Missing(message, where) -> Ok(Missing(message, where))
+      }
+    }
+    Item(target, key, at) -> {
+      let base = _eval(scope, target)?
+      let index = _eval(scope, key)?
+      _item(scope, target, base, index, at)
+    }
+    Filtered(target, name, arguments, at) -> _filter(
+      scope,
+      target,
+      name,
+      arguments,
+      at
+    )
+    Negated(operand) -> {
+      let value = _eval(scope, operand)?
+      Ok(Found(JBool(!_truthy(value))))
+    }
+    Both(left, right) -> {
+      let first = _eval(scope, left)?
+      match _truthy(first) {
+        False -> Ok(Found(JBool(False)))
+        True -> {
+          let second = _eval(scope, right)?
+          Ok(Found(JBool(_truthy(second))))
+        }
+      }
+    }
+    Either(left, right) -> {
+      let first = _eval(scope, left)?
+      match _truthy(first) {
+        True -> Ok(Found(JBool(True)))
+        False -> {
+          let second = _eval(scope, right)?
+          Ok(Found(JBool(_truthy(second))))
+        }
+      }
+    }
+    Compared(operator, left, right, at) -> {
+      let a = _value(scope, left, at)?
+      let b = _value(scope, right, at)?
+      _compare(scope, operator, a, b, at)
+    }
+  }
+}
+
+/// A name, from the innermost loop outwards, then the data.
+_lookup(scope: Scope, name: String, at: Pos) -> Val {
+  let local = list.find_map(scope.frames, fn(frame: List(#(String, Val))) {
+    list.key_find(frame, name)
+  })
+  match local {
+    Some(found) -> found
+    None -> match list.key_find(scope.data, name) {
+      Some(found) -> Found(found)
+      None -> {
+        let known = list.concat(
+          list.flat_map(scope.frames, fn(frame: List(#(String, Val))) {
+            list.map(frame, fn(entry: #(String, Val)) { entry.0 })
+          }),
+          list.map(scope.data, fn(entry: #(String, Json)) { entry.0 })
+        )
+        Missing(
+          "`" + name + "` is not defined" + error.suggest(name, known),
+          at
+        )
+      }
+    }
+  }
+}
+
+_item(scope: Scope, target: Expr, base: Val, index: Val, at: Pos) -> Result(
+  Val,
+  TuckError
+) {
+  match #(base, index) {
+    #(Missing(message, where), _) -> Ok(Missing(message, where))
+    #(Found(JArray(items)), Found(JInt(n))) -> {
+      let position = match n < 0 {
+        True -> list.length(items) + n
+        False -> n
+      }
+      match list.at(items, position) {
+        Some(found) -> Ok(Found(found))
+        None -> Ok(Missing(
+          _path(target) + " has " + int.to_string(list.length(items)) + " items, so there is no item " + int.to_string(
+            n
+          ),
+          at
+        ))
+      }
+    }
+    #(Found(JObject(entries)), Found(JString(key))) -> match list.key_find(
+      entries,
+      key
+    ) {
+      Some(found) -> Ok(Found(found))
+      None -> Ok(Missing(
+        _path(target) + " has no field \"" + key + "\"" + error.suggest(
+          key,
+          list.map(entries, fn(entry: #(String, Json)) { entry.0 })
+        ),
+        at
+      ))
+    }
+    #(Found(JArray(_)), _) -> Error(TuckError(
+      scope.template,
+      at,
+      "a list's items are numbered: use a whole number inside `[ ]`"
+    ))
+    #(Found(JObject(_)), _) -> Error(TuckError(
+      scope.template,
+      at,
+      "an object's fields are named: use a string inside `[ ]`"
+    ))
+    #(Found(other), _) -> Error(TuckError(
+      scope.template,
+      at,
+      _path(target) + " is " + filter.kind(other) + ", which has no items"
+    ))
+    #(Safe(_), _) -> Error(TuckError(scope.template, at, "text has no items"))
+  }
+}
+
+/// A value that must exist: comparisons and filter arguments need one.
+_value(scope: Scope, expr: Expr, at: Pos) -> Result(Json, TuckError) {
+  let found = _eval(scope, expr)?
+  match found {
+    Found(value) -> Ok(value)
+    Safe(text) -> Ok(JString(text))
+    Missing(message, where) -> Error(TuckError(scope.template, where, message))
+  }
+}
+
+_compare(
+  scope: Scope,
+  operator: String,
+  left: Json,
+  right: Json,
+  at: Pos
+) -> Result(Val, TuckError) {
+  let fail = fn(message: String) { Error(TuckError(scope.template, at, message)) }
+  match operator {
+    "==" -> Ok(Found(JBool(filter.same(left, right))))
+    "!=" -> Ok(Found(JBool(!filter.same(left, right))))
+    "in" -> match right {
+      JArray(items) -> Ok(Found(JBool(list.any(items, fn(item: Json) {
+        filter.same(left, item)
+      }))))
+      JString(text) -> match left {
+        JString(part) -> Ok(Found(JBool(string.contains(text, part))))
+        other -> fail(
+          "only text can be looked for in text, not " + filter.kind(other)
+        )
+      }
+      JObject(entries) -> match left {
+        JString(key) -> Ok(
+          Found(JBool(list.any(entries, fn(entry: #(String, Json)) {
+            entry.0 == key
+          })))
+        )
+        other -> fail(
+          "an object's field names are strings, not " + filter.kind(other)
+        )
+      }
+      other -> fail(
+        "`in` needs a list, a string or an object on its right, not " + filter.kind(
+          other
+        )
+      )
+    }
+    _ -> match filter.compare(left, right) {
+      Error(message) -> fail(message)
+      Ok(order) -> {
+        let holds = match #(operator, order) {
+          #("<", order) -> order == Order.Less
+          #("<=", order) -> order != Order.Greater
+          #(">", order) -> order == Order.Greater
+          #(">=", order) -> order != Order.Less
+          _ -> False
+        }
+        Ok(Found(JBool(holds)))
+      }
+    }
+  }
+}
+
+_filter(
+  scope: Scope,
+  target: Expr,
+  name: String,
+  arguments: List(Expr),
+  at: Pos
+) -> Result(Val, TuckError) {
+  let _ = _special_arity(scope, name, arguments, at)?
+  let input = _eval(scope, target)?
+  match name {
+    "default" -> match input {
+      Missing(_, _) | Found(JNull) -> match arguments {
+        [fallback] -> _eval(scope, fallback)
+        _ -> Error(TuckError(
+          scope.template,
+          at,
+          "`default` takes one value: `| default(\"nobody\")`"
+        ))
+      }
+      _ -> Ok(input)
+    }
+    "safe" -> match input {
+      Missing(message, where) -> Error(
+        TuckError(scope.template, where, message)
+      )
+      Safe(_) -> Ok(input)
+      Found(value) -> match filter.text(value) {
+        Ok(text) -> Ok(Safe(text))
+        Error(reason) -> Error(TuckError(scope.template, at, reason))
+      }
+    }
+    "escape" -> match input {
+      Missing(message, where) -> Error(
+        TuckError(scope.template, where, message)
+      )
+      Safe(_) -> Ok(input)
+      Found(value) -> match filter.text(value) {
+        Ok(text) -> Ok(Safe(filter.escape_html(text)))
+        Error(reason) -> Error(TuckError(scope.template, at, reason))
+      }
+    }
+    _ -> {
+      let known = scope.filters
+      let chosen = match list.key_find(known, name) {
+        Some(found) -> Ok(found)
+        None -> Error(TuckError(
+          scope.template,
+          at,
+          "unknown filter `" + name + "`" + error.suggest(
+            name,
+            list.concat(
+              list.map(known, fn(entry: #(String, Filter)) { entry.0 }),
+              filter.special()
+            )
+          )
+        ))
+      }?
+      let value = match input {
+        Found(v) -> Ok(v)
+        Safe(text) -> Ok(JString(text))
+        Missing(message, where) -> Error(
+          TuckError(scope.template, where, message)
+        )
+      }?
+      let values = list.try_map(arguments, fn(argument: Expr) {
+        _value(scope, argument, at)
+      })?
+      match chosen.run(value, values) {
+        Ok(result) -> Ok(Found(result))
+        Error(reason) -> Error(TuckError(scope.template, at, reason))
+      }
+    }
+  }
+}
+
+_truthy(value: Val) -> Bool {
+  match value {
+    Found(v) -> filter.truthy(v)
+    Safe(text) -> text != ""
+    Missing(_, _) -> False
+  }
+}
+
+/// An expression as it was written, near enough, for messages.
+_path(expr: Expr) -> String {
+  "`" + _spelling(expr) + "`"
+}
+
+_spelling(expr: Expr) -> String {
+  match expr {
+    Call(name, _, _) -> name + "()"
+    Variable(name, _) -> name
+    Field(target, name, _) -> _spelling(target) + "." + name
+    Item(target, _, _) -> _spelling(target) + "[…]"
+    Filtered(target, name, _, _) -> _spelling(target) + " | " + name
+    Literal(_) -> "the value"
+    _ -> "the expression"
+  }
+}
+
+// Validate syntax even when a lazy default will not need its fallback value.
+_special_arity(scope: Scope, name: String, arguments: List(Expr), at: Pos) -> Result(
+  Nil,
+  TuckError
+) {
+  match #(name, arguments) {
+    #("default", [_]) -> Ok(Nil)
+    #("default", _) -> Error(
+      TuckError(
+        scope.template,
+        at,
+        "`default` takes one value: `| default(\"nobody\")`"
+      )
+    )
+    #("safe", []) | #("escape", []) -> Ok(Nil)
+    #("safe", _) | #("escape", _) -> Error(
+      TuckError(scope.template, at, "`" + name + "` does not take arguments")
+    )
+    _ -> Ok(Nil)
+  }
+}
+
+_parent_loop(scope: Scope) -> Json {
+  match list.find_map(scope.frames, fn(frame) { list.key_find(frame, "loop") }) {
+    Some(Found(parent)) -> parent
+    _ -> JNull()
+  }
+}
+
+_assigned_value(scope: Scope, expression: Expr, _at: Pos) -> Result(
+  Val,
+  TuckError
+) {
+  let value = _eval(scope, expression)?
+  match value {
+    Missing(message, at) -> Error(TuckError(scope.template, at, message))
+    _ -> Ok(value)
+  }
+}
+
+_bindings(scope: Scope, arguments: List(#(String, Expr)), at: Pos) -> Result(
+  List(#(String, Val)),
+  TuckError
+) {
+  list.try_map(arguments, fn(argument) {
+    let value = _assigned_value(scope, argument.1, at)?
+    Ok(#(argument.0, value))
+  })
+}
+
+_call(scope: Scope, name: String, arguments: List(Expr), at: Pos) -> Result(
+  Val,
+  TuckError
+) {
+  match name {
+    "super" -> match arguments {
+      [] -> match scope.parents {
+        [parent, ..rest] -> {
+          let tree = _nodes(
+            _with_parent(scope, parent.owner, rest),
+            parent.body,
+            string_tree.new()
+          )?
+          Ok(Safe(string_tree.to_string(tree)))
+        }
+        [] -> Error(
+          TuckError(scope.template, at, "`super()` has no parent block here")
+        )
+      }
+      _ -> Error(
+        TuckError(scope.template, at, "`super()` does not take arguments")
+      )
+    }
+    _ -> match list.key_find(scope.functions, name) {
+      None -> Error(
+        TuckError(
+          scope.template,
+          at,
+          "unknown function `" + name + "`" + error.suggest(
+            name,
+            list.map(scope.functions, fn(entry) { entry.0 })
+          )
+        )
+      )
+      Some(function) -> {
+        let values = list.try_map(arguments, fn(argument) {
+          _value(scope, argument, at)
+        })?
+        match function.run(values) {
+          Ok(value) -> Ok(Found(value))
+          Error(message) -> Error(
+            TuckError(scope.template, at, "`" + name + "`: " + message)
+          )
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,586 @@
+//// Reading a template is mostly waiting for a curly brace.
+////
+//// The lexer walks the source one character at a time. Outside tags it
+//// collects plain text; inside `{{ … }}` and `{% … %}` it reads names,
+//// strings, numbers and symbols. `{# … #}` comments disappear, and
+//// `{% raw %} … {% endraw %}` becomes text exactly as written.
+////
+//// A `-` just inside a delimiter, as in `{%-` or `-}}`, trims the whitespace
+//// on that side of the tag, so a template can stay readable without
+//// scattering blank lines through its output.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module lexer
+
+import pooka/float
+import pooka/int
+import pooka/list
+import pooka/string
+import tuck/error.{Pos, TuckError}
+
+/// One piece of a template.
+class Token {}
+
+/// Text outside any tag, printed as it is.
+class Text(value: String) is Token
+
+/// `{{`, or `{{-` when `trim` is set.
+class OpenPrint(trim: Bool) is Token
+
+/// `}}`, or `-}}` when `trim` is set.
+class ClosePrint(trim: Bool) is Token
+
+/// `{%`, or `{%-` when `trim` is set.
+class OpenTag(trim: Bool) is Token
+
+/// `%}`, or `-%}` when `trim` is set.
+class CloseTag(trim: Bool) is Token
+
+/// A name, such as `user`, `if` or `upper`.
+class Name(value: String) is Token
+
+/// A quoted string, with its escapes already read.
+class Str(value: String) is Token
+
+/// A whole number.
+class Integer(value: Int) is Token
+
+/// A number with a decimal point.
+class Decimal(value: Float) is Token
+
+/// Punctuation and operators: `.` `,` `|` `(` `)` `[` `]` `=` `==` `!=` `<`
+/// `<=` `>` `>=`.
+class Symbol(value: String) is Token
+
+/// A token and where it starts.
+class Lexeme(token: Token, at: Pos)
+
+/// Read a template into lexemes, or say where it stops making sense.
+///
+/// ```pooka
+/// import tuck/lexer
+///
+/// let assert Ok(lexemes) = lexer.lex("page", "Hi {{ name }}")
+/// assert list.length(lexemes) == 4
+/// ```
+lex(template: String, source: String) -> Result(List(Lexeme), TuckError) {
+  let found = _text(template, string.graphemes(source), Pos(1, 1), [], [])?
+  Ok(_trim(found))
+}
+
+// --- text ----------------------------------------------------------------------
+
+/// Collect text up to the next tag. `pending` holds the text so far, newest
+/// first; `start` is where it began.
+_text(
+  template: String,
+  rest: List(String),
+  start: Pos,
+  pending: List(String),
+  acc: List(Lexeme)
+) -> Result(List(Lexeme), TuckError) {
+  match rest {
+    [] -> Ok(list.reverse(_flush(pending, start, acc)))
+    ["{", "{", ..after] -> {
+      let at = _here(start, pending)
+      let #(trim, inside) = _trim_mark(after)
+      let opened = list.prepend(_flush(pending, start, acc), Lexeme(
+        OpenPrint(trim),
+        at
+      ))
+      _inside(template, inside, _move(at, _width(trim, 2)), "}}", opened)
+    }
+    ["{", "%", ..after] -> {
+      let at = _here(start, pending)
+      let #(trim, inside) = _trim_mark(after)
+      let opened = list.prepend(_flush(pending, start, acc), Lexeme(
+        OpenTag(trim),
+        at
+      ))
+      _inside(template, inside, _move(at, _width(trim, 2)), "%}", opened)
+    }
+    ["{", "#", ..after] -> {
+      let at = _here(start, pending)
+      let flushed = _flush(pending, start, acc)
+      let #(after_comment, end) = _comment(template, after, _move(at, 2), at)?
+      _text(template, after_comment, end, [], flushed)
+    }
+    [c, ..after] -> _text(template, after, start, list.prepend(pending, c), acc)
+  }
+}
+
+/// Skip a comment, returning what follows it and where.
+_comment(
+  template: String,
+  rest: List(String),
+  pos: Pos,
+  opened: Pos
+) -> Result(#(List(String), Pos), TuckError) {
+  match rest {
+    [] -> Error(
+      TuckError(template, opened, "this comment is never closed with `#}`")
+    )
+    ["#", "}", ..after] -> Ok(#(after, _move(pos, 2)))
+    [c, ..after] -> _comment(template, after, _step(pos, c), opened)
+  }
+}
+
+/// The text so far as one `Text` lexeme, if there is any.
+_flush(pending: List(String), start: Pos, acc: List(Lexeme)) -> List(Lexeme) {
+  match pending {
+    [] -> acc
+    _ -> list.prepend(
+      acc,
+      Lexeme(Text(string.join(list.reverse(pending), "")), start)
+    )
+  }
+}
+
+/// Where the text in `pending` ends.
+_here(start: Pos, pending: List(String)) -> Pos {
+  list.fold(list.reverse(pending), start, _step)
+}
+
+_trim_mark(rest: List(String)) -> #(Bool, List(String)) {
+  match rest {
+    ["-", ..after] -> #(True, after)
+    _ -> #(False, rest)
+  }
+}
+
+_width(trim: Bool, base: Int) -> Int {
+  match trim {
+    True -> base + 1
+    False -> base
+  }
+}
+
+// --- inside a tag -----------------------------------------------------------------
+
+/// Read the tokens inside `{{ … }}` or `{% … %}` until `close`.
+_inside(
+  template: String,
+  rest: List(String),
+  pos: Pos,
+  close: String,
+  acc: List(Lexeme)
+) -> Result(List(Lexeme), TuckError) {
+  match rest {
+    [] -> Error(
+      TuckError(template, pos, "this tag is never closed with `" + close + "`")
+    )
+    [" ", ..after] | ["\t", ..after] | ["\n", ..after] | ["\r", ..after] | [
+      "\r\n",
+      ..after
+    ] -> _inside(template, after, _step(pos, _first(rest)), close, acc)
+    ["-", "}", "}", ..after] if close == "}}" -> _closed(
+      template,
+      after,
+      pos,
+      3,
+      Lexeme(ClosePrint(True), pos),
+      acc
+    )
+    ["}", "}", ..after] if close == "}}" -> _closed(
+      template,
+      after,
+      pos,
+      2,
+      Lexeme(ClosePrint(False), pos),
+      acc
+    )
+    ["-", "%", "}", ..after] if close == "%}" -> _closed(
+      template,
+      after,
+      pos,
+      3,
+      Lexeme(CloseTag(True), pos),
+      acc
+    )
+    ["%", "}", ..after] if close == "%}" -> _closed(
+      template,
+      after,
+      pos,
+      2,
+      Lexeme(CloseTag(False), pos),
+      acc
+    )
+    ["\"", ..after] | ["'", ..after] -> {
+      let #(value, after_string, end) = _string(
+        template,
+        after,
+        _first(rest),
+        _move(pos, 1),
+        pos,
+        []
+      )?
+      _inside(template, after_string, end, close, list.prepend(acc, Lexeme(
+        Str(value),
+        pos
+      )))
+    }
+    [c, ..after] if _is_digit(c) -> {
+      let #(token, after_number, width) = _number(template, rest, pos)?
+      _inside(template, after_number, _move(pos, width), close, list.prepend(
+        acc,
+        Lexeme(token, pos)
+      ))
+    }
+    ["-", d, ..] if _is_digit(d) -> {
+      let #(token, after_number, width) = _number(template, rest, pos)?
+      _inside(template, after_number, _move(pos, width), close, list.prepend(
+        acc,
+        Lexeme(token, pos)
+      ))
+    }
+    [c, ..] if _is_name_start(c) -> {
+      let #(name, after_name) = _name(rest, [])
+      _inside(
+        template,
+        after_name,
+        _move(pos, string.length(name)),
+        close,
+        list.prepend(acc, Lexeme(Name(name), pos))
+      )
+    }
+    ["=", "=", ..after] | ["!", "=", ..after] | ["<", "=", ..after] | [
+      ">",
+      "=",
+      ..after
+    ] -> _inside(template, after, _move(pos, 2), close, list.prepend(
+      acc,
+      Lexeme(Symbol(_first(rest) + "="), pos)
+    ))
+    [c, ..after] if list.contains(
+      [".", ",", "|", "(", ")", "[", "]", "=", "<", ">"],
+      c
+    ) -> _inside(
+      template,
+      after,
+      _move(pos, 1),
+      close,
+      list.prepend(acc, Lexeme(Symbol(c), pos))
+    )
+    [c, ..] -> Error(
+      TuckError(template, pos, "unexpected `" + c + "` inside a tag")
+    )
+  }
+}
+
+/// After a closing delimiter: back to text, unless the tag was `raw`.
+_closed(
+  template: String,
+  rest: List(String),
+  pos: Pos,
+  width: Int,
+  close: Lexeme,
+  acc: List(Lexeme)
+) -> Result(List(Lexeme), TuckError) {
+  let after = _move(pos, width)
+  match acc {
+    [Lexeme(Name("raw"), _), Lexeme(OpenTag(open_trim), opened), ..earlier] -> {
+      let #(raw, after_raw, end, end_trims) = _raw(
+        template,
+        rest,
+        after,
+        opened,
+        []
+      )?
+      // `{%- raw` trims the text before the block, `raw -%}` the start of the
+      // block, `{%- endraw` its end, and `endraw -%}` the text after it.
+      let before = match open_trim {
+        True -> _trim_last_text(earlier)
+        False -> earlier
+      }
+      let content = match close.token {
+        CloseTag(True) -> string.trim_start(raw)
+        _ -> raw
+      }
+      let content = match end_trims.0 {
+        True -> string.trim_end(content)
+        False -> content
+      }
+      let #(next, next_pos) = match end_trims.1 {
+        True -> _skip_whitespace(after_raw, end)
+        False -> #(after_raw, end)
+      }
+      _text(template, next, next_pos, [], list.prepend(before, Lexeme(
+        Text(content),
+        after
+      )))
+    }
+    _ -> _text(template, rest, after, [], list.prepend(acc, close))
+  }
+}
+
+/// Trim the end of the most recent text, if the most recent lexeme is text.
+_trim_last_text(acc: List(Lexeme)) -> List(Lexeme) {
+  match acc {
+    [Lexeme(Text(value), at), ..earlier] -> list.prepend(earlier, Lexeme(
+      Text(string.trim_end(value)),
+      at
+    ))
+    _ -> acc
+  }
+}
+
+_skip_whitespace(rest: List(String), pos: Pos) -> #(List(String), Pos) {
+  match rest {
+    [c, ..after] if c == " " || c == "\t" || c == "\n" || c == "\r" || c == "\r\n" -> _skip_whitespace(
+      after,
+      _step(pos, c)
+    )
+    _ -> #(rest, pos)
+  }
+}
+
+/// Everything up to `{% endraw %}`, as written, with the end tag's two trim
+/// marks.
+_raw(
+  template: String,
+  rest: List(String),
+  pos: Pos,
+  opened: Pos,
+  acc: List(String)
+) -> Result(#(String, List(String), Pos, #(Bool, Bool)), TuckError) {
+  match rest {
+    [] -> Error(TuckError(
+      template,
+      opened,
+      "this `raw` block is never closed with `{% endraw %}`"
+    ))
+    ["{", "%", ..after] -> match _endraw(after, 2) {
+      Ok(#(trims, after_end, width)) -> Ok(#(
+        string.join(list.reverse(acc), ""),
+        after_end,
+        _move(pos, width),
+        trims
+      ))
+      Error(Nil) -> _raw(template, after, _move(pos, 2), opened, list.prepend(
+        list.prepend(acc, "{"),
+        "%"
+      ))
+    }
+    [c, ..after] -> _raw(template, after, _step(pos, c), opened, list.prepend(
+      acc,
+      c
+    ))
+  }
+}
+
+/// Does `endraw %}` follow, with optional spaces and trim marks? Returns both
+/// trim marks, what follows the tag, and its width.
+_endraw(rest: List(String), width: Int) -> Result(
+  #(#(Bool, Bool), List(String), Int),
+  Nil
+) {
+  let #(trim, after_mark) = _trim_mark(rest)
+  let #(spaces, after_space) = _spaces(after_mark, 0)
+  match after_space {
+    ["e", "n", "d", "r", "a", "w", ..after_word] -> {
+      let #(more, after_more) = _spaces(after_word, 0)
+      let #(close_trim, after_close_mark) = _trim_mark(after_more)
+      match after_close_mark {
+        ["%", "}", ..after] -> Ok(#(
+          #(trim, close_trim),
+          after,
+          width + _width(trim, 0) + spaces + 6 + more + _width(close_trim, 0) + 2
+        ))
+        _ -> Error(Nil)
+      }
+    }
+    _ -> Error(Nil)
+  }
+}
+
+_spaces(rest: List(String), count: Int) -> #(Int, List(String)) {
+  match rest {
+    [" ", ..after] | ["\t", ..after] -> _spaces(after, count + 1)
+    _ -> #(count, rest)
+  }
+}
+
+// --- strings, numbers, names --------------------------------------------------------
+
+_string(
+  template: String,
+  rest: List(String),
+  quote: String,
+  pos: Pos,
+  opened: Pos,
+  acc: List(String)
+) -> Result(#(String, List(String), Pos), TuckError) {
+  match rest {
+    [] | ["\n", ..] | ["\r\n", ..] | ["\r", ..] -> Error(TuckError(
+      template,
+      opened,
+      "this string is never closed with " + quote
+    ))
+    ["\\", c, ..after] -> {
+      let escaped = match c {
+        "n" -> Ok("\n")
+        "t" -> Ok("\t")
+        "\\" -> Ok("\\")
+        "\"" -> Ok("\"")
+        "'" -> Ok("'")
+        _ -> Error(
+          TuckError(template, pos, "unknown escape `\\" + c + "` in a string")
+        )
+      }?
+      _string(
+        template,
+        after,
+        quote,
+        _move(pos, 2),
+        opened,
+        list.prepend(acc, escaped)
+      )
+    }
+    [c, ..after] if c == quote -> Ok(
+      #(string.join(list.reverse(acc), ""), after, _move(pos, 1))
+    )
+    [c, ..after] -> _string(
+      template,
+      after,
+      quote,
+      _step(pos, c),
+      opened,
+      list.prepend(acc, c)
+    )
+  }
+}
+
+/// A number, possibly negative, possibly with a decimal point.
+_number(template: String, rest: List(String), pos: Pos) -> Result(
+  #(Token, List(String), Int),
+  TuckError
+) {
+  let #(sign, unsigned) = match rest {
+    ["-", ..after] -> #("-", after)
+    _ -> #("", rest)
+  }
+  let #(whole, after_whole) = _digits(unsigned, [])
+  match after_whole {
+    [".", d, ..] if _is_digit(d) -> {
+      let #(fraction, after_fraction) = _digits(list.drop(after_whole, 1), [])
+      let text = sign + whole + "." + fraction
+      match float.parse(text) {
+        Ok(value) -> Ok(#(Decimal(value), after_fraction, string.length(text)))
+        Error(_) -> Error(
+          TuckError(template, pos, "`" + text + "` is not a number")
+        )
+      }
+    }
+    _ -> {
+      let text = sign + whole
+      match int.parse(text) {
+        Ok(value) -> Ok(#(Integer(value), after_whole, string.length(text)))
+        Error(_) -> Error(
+          TuckError(template, pos, "`" + text + "` is not a number")
+        )
+      }
+    }
+  }
+}
+
+_digits(rest: List(String), acc: List(String)) -> #(String, List(String)) {
+  match rest {
+    [c, ..after] if _is_digit(c) -> _digits(after, list.prepend(acc, c))
+    _ -> #(string.join(list.reverse(acc), ""), rest)
+  }
+}
+
+_name(rest: List(String), acc: List(String)) -> #(String, List(String)) {
+  match rest {
+    [c, ..after] if _is_name_start(c) || _is_digit(c) -> _name(
+      after,
+      list.prepend(acc, c)
+    )
+    _ -> #(string.join(list.reverse(acc), ""), rest)
+  }
+}
+
+_is_digit(c: String) -> Bool {
+  match string.to_list(c) {
+    [code] -> code >= 48 && code <= 57
+    _ -> False
+  }
+}
+
+_is_name_start(c: String) -> Bool {
+  match string.to_list(c) {
+    [code] -> code >= 97 && code <= 122 || code >= 65 && code <= 90 || code == 95
+    _ -> False
+  }
+}
+
+// --- positions ------------------------------------------------------------------------
+
+_first(rest: List(String)) -> String {
+  match rest {
+    [c, ..] -> c
+    [] -> ""
+  }
+}
+
+_move(pos: Pos, columns: Int) -> Pos {
+  Pos(pos.line, pos.column + columns)
+}
+
+/// Move past one character, starting a new line after a line break.
+_step(pos: Pos, c: String) -> Pos {
+  match c {
+    "\n" | "\r\n" | "\r" -> Pos(pos.line + 1, 1)
+    _ -> Pos(pos.line, pos.column + 1)
+  }
+}
+
+// --- whitespace control ------------------------------------------------------------------
+
+/// Apply `{%-` and `-%}`: trim the whitespace of the text beside each marked
+/// delimiter.
+_trim(lexemes: List(Lexeme)) -> List(Lexeme) {
+  _trim_after(_trim_before(lexemes, []), [])
+}
+
+/// A marked opener trims the end of the text just before it.
+_trim_before(rest: List(Lexeme), acc: List(Lexeme)) -> List(Lexeme) {
+  match rest {
+    [] -> list.reverse(acc)
+    [Lexeme(Text(value), at), next, ..after] if _opens_trimmed(next.token) -> _trim_before(
+      list.prepend(after, next),
+      list.prepend(acc, Lexeme(Text(string.trim_end(value)), at))
+    )
+    [one, ..after] -> _trim_before(after, list.prepend(acc, one))
+  }
+}
+
+/// A marked closer trims the start of the text just after it.
+_trim_after(rest: List(Lexeme), acc: List(Lexeme)) -> List(Lexeme) {
+  match rest {
+    [] -> list.reverse(acc)
+    [closer, Lexeme(Text(value), at), ..after] if _closes_trimmed(closer.token) -> _trim_after(
+      after,
+      list.prepend(
+        list.prepend(acc, closer),
+        Lexeme(Text(string.trim_start(value)), at)
+      )
+    )
+    [one, ..after] -> _trim_after(after, list.prepend(acc, one))
+  }
+}
+
+_opens_trimmed(token: Token) -> Bool {
+  match token {
+    OpenPrint(True) | OpenTag(True) -> True
+    _ -> False
+  }
+}
+
+_closes_trimmed(token: Token) -> Bool {
+  match token {
+    ClosePrint(True) | CloseTag(True) -> True
+    _ -> False
+  }
+}

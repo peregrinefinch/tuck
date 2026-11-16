@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: test
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          rebar3-version: "3"
+      - uses: peregrinefinch/setup-pooka@v1
+        with:
+          pooka-version: ">=0.3.2"
+      - run: pooka deps download
+      - run: pooka test
+      - run: pooka format --check
+      - run: pooka docs
+      - run: pooka publish --dry-run

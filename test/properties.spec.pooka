@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module properties_test
+
+import tuck
+import tuck/filter
+import pooka/json.{JObject, JString}
+import poke/generator
+import poke/property
+import poke/should
+
+test "literal template text retains Unicode whitespace and punctuation" {
+  property.for_all(
+    generator.strings(
+      ["a", "🦉", "e\u{301}", "<", "&", "'", "\n", "\r\n", " "],
+      100
+    ),
+    fn(text) {
+      let page = tuck.parse(text) |> should.be_ok()
+      should.equal(tuck.render(page, JObject([])), Ok(text))
+    }
+  )
+}
+
+test "parsed templates can render different values without retaining old data" {
+  let page = tuck.parse("{{ name }}") |> should.be_ok()
+  property.for_all(
+    generator.strings(["a", "🦉", "<", ">", "&", "\""], 80),
+    fn(name) {
+      should.equal(
+        tuck.render(page, JObject([#("name", JString(name))])),
+        Ok(filter.escape_html(name))
+      )
+      should.equal(
+        tuck.render(page, JObject([#("name", JString("next"))])),
+        Ok("next")
+      )
+    }
+  )
+}
+
+test "explicit escaping is idempotent through safe-value tracking" {
+  let page = tuck.parse("{{ name | escape | escape }}") |> should.be_ok()
+  property.for_all(
+    generator.strings(["a", "🦉", "<", ">", "&", "\"", "'"], 80),
+    fn(name) {
+      should.equal(
+        tuck.render(page, JObject([#("name", JString(name))])),
+        Ok(filter.escape_html(name))
+      )
+    }
+  )
+}
+
+test "ordinary filters after safe reset automatic escaping" {
+  let page = tuck.parse("{{ name | safe | trim }}") |> should.be_ok()
+  should.equal(
+    tuck.render(page, JObject([#("name", JString("<owl>"))])),
+    Ok("&lt;owl&gt;")
+  )
+}

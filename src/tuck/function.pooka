@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A template can ask for a function only when its host has registered one.
+//// Namespaces are names, not runtime modules: `time.now` can use an injected
+//// build clock without giving the template access to arbitrary Pooka calls.
+module function
+
+import pooka/list
+import pooka/json.{Json}
+import pooka/string
+
+/// Arguments and results use the same typed values as template data. A host
+/// validates its argument contract and returns an explanatory error on failure.
+class Function(run: fn(List(Json)) -> Result(Json, String))
+
+/// Namespace components are identifiers. `super` belongs to block inheritance.
+valid_name(name: String) -> Bool {
+  let parts = string.split(name, ".")
+  let reserved = match parts {
+    [first, .._rest] -> list.contains(
+      ["super", "true", "false", "nil", "null", "and", "or", "not", "in"],
+      first
+    )
+    [] -> True
+  }
+  !reserved && list.all(parts, _identifier)
+}
+
+_identifier(name: String) -> Bool {
+  let letters = string.graphemes(name)
+  match letters {
+    [first, ..rest] -> string.contains(
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_",
+      first
+    ) && list.all(rest, fn(c) {
+      string.contains(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789",
+        c
+      )
+    })
+    [] -> False
+  }
+}

@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module regressions_test
+
+import tuck
+import pooka/json.{JObject, JString}
+import pooka/list
+import poke/should
+
+_library() -> tuck.Library {
+  let pages = tuck.library() |> tuck.add(
+    "host.html.tuck",
+    "{% block title %}Host{% endblock %}|{% include \"partial.html.tuck\" %}"
+  ) |> should.be_ok()
+  pages |> tuck.add(
+    "partial.html.tuck",
+    "{% block title %}Partial{% endblock %}"
+  ) |> should.be_ok()
+}
+
+test "includes own their blocks rather than borrowing the caller overrides" {
+  should.equal(
+    tuck.render_named(_library(), "host.html.tuck", JObject([])),
+    Ok("Host|Partial")
+  )
+}
+
+test "invalid default arguments fail even when the target is present" {
+  let template = tuck.parse("{{ name | default }}") |> should.be_ok()
+  tuck.render(template, JObject([#("name", JString("Owl"))])) |> should.be_error()
+  Nil
+}
+
+test "zero-argument filters reject arguments instead of silently dropping them" {
+  list.each(
+    [
+      "upper",
+      "lower",
+      "capitalize",
+      "trim",
+      "length",
+      "first",
+      "last",
+      "reverse",
+      "sort",
+      "json",
+      "safe",
+      "escape"
+    ],
+    fn(name) {
+      let template = tuck.parse("{{ name | " + name + "(1) }}") |> should.be_ok()
+      let problem = tuck.render(template, JObject([#("name", JString("Owl"))])) |> should.be_error()
+      should.contain_text(problem.message, "argument")
+    }
+  )
+}
+
+test "an included inheritance chain owns its overrides" {
+  let pages = _library()
+  let pages = pages |> tuck.add(
+    "base.html.tuck",
+    "{% block title %}Base{% endblock %}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add(
+    "partial.html.tuck",
+    "{% extends \"base.html.tuck\" %}{% block title %}Derived partial{% endblock %}"
+  ) |> should.be_ok()
+  should.equal(
+    tuck.render_named(pages, "host.html.tuck", JObject([])),
+    Ok("Host|Derived partial")
+  )
+}
+
+test "includes retain loop values and the entry output policy" {
+  let pages = tuck.library() |> tuck.add(
+    "host.html.tuck",
+    "{% for name in names %}{% include \"piece.txt.tuck\" %}{% endfor %}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add("piece.txt.tuck", "{{ name }}") |> should.be_ok()
+  let assert Ok(data) = json.decode("{\"names\":[\"<Owl>\"]}")
+  should.equal(
+    tuck.render_named(pages, "host.html.tuck", data),
+    Ok("&lt;Owl&gt;")
+  )
+}
+
+test "valid default fallbacks remain lazy" {
+  let page = tuck.parse("{{ name | default(missing.field) }}") |> should.be_ok()
+  should.equal(
+    tuck.render(page, JObject([#("name", JString("Owl"))])),
+    Ok("Owl")
+  )
+}
+
+test "duplicate block errors point at the second declaration" {
+  let problem = tuck.parse_named(
+    "page.tuck",
+    "{% block title %}A{% endblock %}\n{% block title %}B{% endblock %}",
+    tuck.Escape.Html
+  ) |> should.be_error()
+  should.equal(problem.at.line, 2)
+  should.contain_text(problem.message, "declared more than once")
+}
+
+test "duplicate blocks inside branches are rejected too" {
+  tuck.parse(
+    "{% if true %}{% block title %}A{% endblock %}{% else %}{% block title %}B{% endblock %}{% endif %}"
+  ) |> should.be_error()
+  Nil
+}
+
+test "loop metadata reports reverse positions and parent loops" {
+  let page = tuck.parse(
+    "{% for row in rows %}{% for bird in row %}{{ loop.parent.index }}.{{ loop.index }}/{{ loop.revindex }}/{{ loop.revindex0 }};{% endfor %}{% endfor %}"
+  ) |> should.be_ok()
+  let assert Ok(data) = json.decode("{\"rows\":[[\"a\",\"b\"],[\"c\"]]}")
+  should.equal(tuck.render(page, data), Ok("1.1/2/1;1.2/1/0;2.1/1/0;"))
+}
+
+test "loop key and value names must be distinct" {
+  let problem = tuck.parse("{% for bird, bird in birds %}{% endfor %}") |> should.be_error()
+  should.contain_text(problem.message, "different names")
+}
+
+test "loop variables cannot hide metadata or reserved expressions" {
+  list.each(
+    ["loop", "true", "false", "nil", "null", "and", "or", "not", "in"],
+    fn(name) {
+      let problem = tuck.parse("{% for " + name + " in birds %}{% endfor %}") |> should.be_error()
+      should.contain_text(problem.message, "reserved")
+    }
+  )
+}
+
+test "uppercase markup extensions select HTML escaping" {
+  should.equal(tuck.escape_for("pages/HOME.HTML.TUCK"), tuck.Escape.Html)
+  should.equal(tuck.escape_for("note.TXT.TUCK"), tuck.Escape.Plain)
+}
+
+test "mixed numeric comparisons retain large integer precision" {
+  let page = tuck.parse(
+    "{{ big == rounded }}|{{ big > rounded }}|{{ rounded < big }}"
+  ) |> should.be_ok()
+  let data = JObject(
+    [
+      #("big", json.JInt(9007199254740993)),
+      #("rounded", json.JFloat(9007199254740992.0))
+    ]
+  )
+  should.equal(tuck.render(page, data), Ok("false|true|true"))
+}
+
+test "mixed comparisons handle positive and negative fractional parts" {
+  let page = tuck.parse("{{ a < b }}|{{ b > a }}|{{ c > d }}|{{ d < c }}") |> should.be_ok()
+  let data = JObject(
+    [
+      #("a", json.JInt(1)),
+      #("b", json.JFloat(1.5)),
+      #("c", json.JInt(-1)),
+      #("d", json.JFloat(-1.5))
+    ]
+  )
+  should.equal(tuck.render(page, data), Ok("true|true|true|true"))
+}
+
+test "very large integers do not become zero in mixed equality" {
+  let page = tuck.parse("{{ big == zero }}|{{ big > zero }}") |> should.be_ok()
+  let data = JObject(
+    [
+      #(
+        "big",
+        json.JInt(
+          99999999999999999999999999999999999999999999999999999999999999999
+        )
+      ),
+      #("zero", json.JFloat(0.0))
+    ]
+  )
+  should.equal(tuck.render(page, data), Ok("false|true"))
+}

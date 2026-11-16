@@ -1,0 +1,344 @@
+//// Small helpers that change a value on its way to the page.
+////
+//// A filter takes the value before the `|`, any arguments in parentheses,
+//// and returns a new value or a sentence about why it cannot. Tuck's own
+//// filters live here; a `Library` can add more with `tuck.with_filter`.
+////
+//// `default`, `escape` and `safe` are not here: they need to know whether a
+//// value exists at all, or whether it is already safe to print, so the
+//// renderer handles them itself.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module filter
+
+import pooka/float
+import pooka/int
+import pooka/json.{
+  JArray, JBool, JFloat, JInt, JNull, JObject, JString, Json
+}
+import pooka/list
+import pooka/order.{Order}
+import pooka/string
+
+/// A filter: the value, its arguments, and the new value or a reason.
+class Filter(run: fn(Json, List(Json)) -> Result(Json, String))
+
+/// Every built-in filter, by name.
+///
+/// ```pooka
+/// import tuck/filter
+///
+/// let assert Some(upper) = list.key_find(filter.built_in(), "upper")
+/// assert upper.run(json.JString("owl"), []) == Ok(json.JString("OWL"))
+/// ```
+built_in() -> List(#(String, Filter)) {
+  [
+    #("upper", _without_arguments("upper", _upper)),
+    #("lower", _without_arguments("lower", _lower)),
+    #("capitalize", _without_arguments("capitalize", _capitalize)),
+    #("trim", _without_arguments("trim", _trim)),
+    #("length", _without_arguments("length", _length)),
+    #("join", Filter(_join)),
+    #("first", _without_arguments("first", _first)),
+    #("last", _without_arguments("last", _last)),
+    #("reverse", _without_arguments("reverse", _reverse)),
+    #("sort", _without_arguments("sort", _sort)),
+    #("truncate", Filter(_truncate)),
+    #("replace", Filter(_replace)),
+    #("json", _without_arguments("json", _json))
+  ]
+}
+
+/// The names the renderer handles itself, for suggestions.
+special() -> List(String) {
+  ["default", "escape", "safe"]
+}
+
+/// A value as text, the way `{{ }}` prints it. Lists and objects have no
+/// single obvious spelling, so they are refused with a hint.
+///
+/// ```pooka
+/// import tuck/filter
+///
+/// assert filter.text(json.JInt(3)) == Ok("3")
+/// assert filter.text(json.JNull()) == Ok("")
+/// ```
+text(value: Json) -> Result(String, String) {
+  match value {
+    JString(s) -> Ok(s)
+    JInt(n) -> Ok(int.to_string(n))
+    JFloat(n) -> Ok(float.to_string(n))
+    JBool(True) -> Ok("true")
+    JBool(False) -> Ok("false")
+    JNull -> Ok("")
+    JArray(_) -> Error(
+      "a list cannot be printed as it is; loop over it with `{% for %}`, or use `| join(\", \")`"
+    )
+    JObject(_) -> Error(
+      "an object cannot be printed as it is; print one of its fields, or use `| json`"
+    )
+  }
+}
+
+/// What kind of value this is, for messages.
+kind(value: Json) -> String {
+  match value {
+    JString(_) -> "a string"
+    JInt(_) | JFloat(_) -> "a number"
+    JBool(_) -> "a boolean"
+    JNull -> "nil"
+    JArray(_) -> "a list"
+    JObject(_) -> "an object"
+  }
+}
+
+/// Is the value true enough for `{% if %}`? Everything is, except `false`,
+/// `nil`, zero, and empty strings, lists and objects.
+truthy(value: Json) -> Bool {
+  match value {
+    JBool(b) -> b
+    JNull -> False
+    JString(s) -> s != ""
+    JInt(n) -> n != 0
+    JFloat(n) -> n != 0.0
+    JArray(items) -> items != []
+    JObject(entries) -> entries != []
+  }
+}
+
+// --- the filters ----------------------------------------------------------------
+
+_upper(value: Json, _arguments: List(Json)) -> Result(Json, String) {
+  _on_text(value, string.uppercase)
+}
+
+_lower(value: Json, _arguments: List(Json)) -> Result(Json, String) {
+  _on_text(value, string.lowercase)
+}
+
+_capitalize(value: Json, _arguments: List(Json)) -> Result(Json, String) {
+  _on_text(value, fn(s: String) {
+    string.uppercase(string.slice(s, 0, 1)) + string.lowercase(
+      string.drop_start(s, 1)
+    )
+  })
+}
+
+_trim(value: Json, _arguments: List(Json)) -> Result(Json, String) {
+  _on_text(value, string.trim)
+}
+
+_on_text(value: Json, change: fn(String) -> String) -> Result(Json, String) {
+  let s = text(value)?
+  Ok(JString(change(s)))
+}
+
+_length(value: Json, _arguments: List(Json)) -> Result(Json, String) {
+  match value {
+    JString(s) -> Ok(JInt(string.length(s)))
+    JArray(items) -> Ok(JInt(list.length(items)))
+    JObject(entries) -> Ok(JInt(list.length(entries)))
+    other -> Error(
+      "`length` needs a string, a list or an object, not " + kind(other)
+    )
+  }
+}
+
+_join(value: Json, arguments: List(Json)) -> Result(Json, String) {
+  let separator = match arguments {
+    [] -> Ok("")
+    [JString(s)] -> Ok(s)
+    _ -> Error("`join` takes one string, the separator: `| join(\", \")`")
+  }?
+  match value {
+    JArray(items) -> {
+      let parts = list.try_map(items, text)?
+      Ok(JString(string.join(parts, separator)))
+    }
+    other -> Error("`join` needs a list, not " + kind(other))
+  }
+}
+
+_first(value: Json, _arguments: List(Json)) -> Result(Json, String) {
+  match value {
+    JArray([first, ..]) -> Ok(first)
+    JArray([]) -> Ok(JNull())
+    JString(s) -> Ok(JString(string.slice(s, 0, 1)))
+    other -> Error("`first` needs a list or a string, not " + kind(other))
+  }
+}
+
+_last(value: Json, _arguments: List(Json)) -> Result(Json, String) {
+  match value {
+    JArray(items) -> match list.last(items) {
+      Some(found) -> Ok(found)
+      None -> Ok(JNull())
+    }
+    JString(s) -> Ok(JString(string.slice(s, string.length(s) - 1, 1)))
+    other -> Error("`last` needs a list or a string, not " + kind(other))
+  }
+}
+
+_reverse(value: Json, _arguments: List(Json)) -> Result(Json, String) {
+  match value {
+    JArray(items) -> Ok(JArray(list.reverse(items)))
+    JString(s) -> Ok(JString(string.reverse_graphemes(s)))
+    other -> Error("`reverse` needs a list or a string, not " + kind(other))
+  }
+}
+
+_sort(value: Json, _arguments: List(Json)) -> Result(Json, String) {
+  match value {
+    JArray(items) -> {
+      let all_text = list.all(items, fn(item: Json) {
+        match item {
+          JString(_) -> True
+          _ -> False
+        }
+      })
+      let all_numbers = list.all(items, fn(item: Json) {
+        match item {
+          JInt(_) | JFloat(_) -> True
+          _ -> False
+        }
+      })
+      match #(all_text, all_numbers) {
+        #(True, _) -> Ok(JArray(list.sort_by(items, fn(a: Json, b: Json) {
+          string.compare(_string(a), _string(b))
+        })))
+        #(_, True) -> Ok(JArray(list.sort_by(items, fn(a: Json, b: Json) {
+          _order_numbers(a, b)
+        })))
+        _ -> Error("`sort` needs a list of strings, or a list of numbers")
+      }
+    }
+    other -> Error("`sort` needs a list, not " + kind(other))
+  }
+}
+
+_truncate(value: Json, arguments: List(Json)) -> Result(Json, String) {
+  let #(length, ending) = match arguments {
+    [JInt(n)] if n >= 0 -> Ok(#(n, "…"))
+    [JInt(n), JString(e)] if n >= 0 -> Ok(#(n, e))
+    _ -> Error(
+      "`truncate` takes a length and, if you like, an ending: `| truncate(40)` or `| truncate(40, \"...\")`"
+    )
+  }?
+  let s = text(value)?
+  match string.length(s) <= length {
+    True -> Ok(JString(s))
+    False -> Ok(JString(string.trim_end(string.slice(s, 0, length)) + ending))
+  }
+}
+
+_replace(value: Json, arguments: List(Json)) -> Result(Json, String) {
+  match arguments {
+    [JString(old), JString(replacement)] if old != "" -> {
+      let s = text(value)?
+      Ok(JString(string.replace(s, old, replacement)))
+    }
+    _ -> Error("`replace` takes two strings: `| replace(\"old\", \"new\")`")
+  }
+}
+
+_json(value: Json, _arguments: List(Json)) -> Result(Json, String) {
+  Ok(JString(json.encode(value)))
+}
+
+_string(value: Json) -> String {
+  match value {
+    JString(s) -> s
+    _ -> ""
+  }
+}
+
+// Compare integer parts before visiting Float arithmetic. Converting an
+// arbitrary Int to Float first would round 9007199254740993 down, and might
+// turn a much larger integer into a failed conversion altogether.
+_order_numbers(left: Json, right: Json) -> Order {
+  match #(left, right) {
+    #(JInt(a), JInt(b)) -> int.compare(a, b)
+    #(JInt(a), JFloat(b)) -> _integer_float(a, b)
+    #(JFloat(a), JInt(b)) -> match _integer_float(b, a) {
+      Order.Less -> Order.Greater
+      Order.Greater -> Order.Less
+      Order.Equal -> Order.Equal
+    }
+    #(JFloat(a), JFloat(b)) -> match a < b {
+      True -> Order.Less
+      False -> match a > b {
+        True -> Order.Greater
+        False -> Order.Equal
+      }
+    }
+    _ -> Order.Equal
+  }
+}
+
+_integer_float(integer: Int, decimal: Float) -> Order {
+  let whole = float.truncate(decimal)
+  match int.compare(integer, whole) {
+    Order.Equal -> {
+      let assert Ok(exact) = int.to_float(whole)
+      match decimal > exact {
+        True -> Order.Less
+        False -> match decimal < exact {
+          True -> Order.Greater
+          False -> Order.Equal
+        }
+      }
+    }
+    other -> other
+  }
+}
+
+/// Order two numbers, or two strings; anything else cannot be ordered.
+compare(left: Json, right: Json) -> Result(Order, String) {
+  match #(left, right) {
+    #(JString(a), JString(b)) -> Ok(string.compare(a, b))
+    #(JInt(_), JInt(_)) | #(JInt(_), JFloat(_)) | #(JFloat(_), JInt(_)) | #(
+      JFloat(_),
+      JFloat(_)
+    ) -> Ok(_order_numbers(left, right))
+    _ -> Error("cannot compare " + kind(left) + " with " + kind(right))
+  }
+}
+
+/// Equal values, with `1` and `1.0` counting as equal.
+same(left: Json, right: Json) -> Bool {
+  match #(left, right) {
+    #(JInt(_), JFloat(_)) | #(JFloat(_), JInt(_)) -> _order_numbers(left, right) == Order.Equal
+    _ -> left == right
+  }
+}
+
+/// Text safe to place in HTML: `&`, `<`, `>`, `"` and `'` become entities.
+///
+/// ```pooka
+/// import tuck/filter
+///
+/// assert filter.escape_html("<b>Tom & Jerry</b>") == "&lt;b&gt;Tom &amp; Jerry&lt;/b&gt;"
+/// ```
+escape_html(value: String) -> String {
+  value
+  |> string.replace("&", "&amp;")
+  |> string.replace("<", "&lt;")
+  |> string.replace(">", "&gt;")
+  |> string.replace("\"", "&quot;")
+  |> string.replace("'", "&#39;")
+}
+
+// Keep custom filters free to choose their own signatures. This wrapper belongs
+// only to the built-ins whose documented signature has no arguments.
+_without_arguments(
+  name: String,
+  run: fn(Json, List(Json)) -> Result(Json, String)
+) -> Filter {
+  Filter(fn(value, arguments) {
+    match arguments {
+      [] -> run(value, [])
+      _ -> Error("`" + name + "` does not take arguments")
+    }
+  })
+}

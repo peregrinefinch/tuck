@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module limits_test
+
+import tuck
+import tuck/limits
+import pooka/json.{JObject, JString, Json}
+import pooka/string
+import pooka/list
+import pooka/time
+import poke/fixture
+import pooka/file
+import pooka/path
+import poke/process
+import poke/should
+
+_spin(n: Int) -> Int {
+  _spin(n + 1)
+}
+
+test "checked parsing and rendering preserve normal results" {
+  let page = tuck.parse_checked(
+    "home",
+    "Hello {{ name }}",
+    tuck.Escape.Html,
+    limits.defaults()
+  ) |> should.be_ok()
+  should.equal(
+    tuck.render_checked(
+      page,
+      JObject([#("name", JString("<Owl>"))]),
+      limits.defaults()
+    ),
+    Ok("Hello &lt;Owl&gt;")
+  )
+}
+
+test "source limits measure UTF-8 bytes" {
+  let problem = tuck.parse_checked(
+    "page",
+    "🦉",
+    tuck.Escape.Html,
+    limits.Budget(3, 1000, 100000, 100000, 1000)
+  ) |> should.be_error()
+  should.equal(problem.template, "page")
+  should.contain_text(problem.message, "source byte budget")
+}
+
+test "output limits are applied before text leaves the worker" {
+  let page = tuck.parse("{{ name }}") |> should.be_ok()
+  let problem = tuck.render_checked(
+    page,
+    JObject([#("name", JString("🦉"))]),
+    limits.Budget(1000, 3, 100000, 100000, 1000)
+  ) |> should.be_error()
+  should.contain_text(problem.message, "output byte budget")
+}
+
+test "checked parsing retains exact parser diagnostics" {
+  let problem = tuck.parse_checked(
+    "home",
+    "Hello\n{% if %}",
+    tuck.Escape.Html,
+    limits.defaults()
+  ) |> should.be_error()
+  should.equal(problem.at.line, 2)
+  should.contain_text(problem.message, "expected a value")
+}
+
+test "an infinite custom filter is stopped by the work budget" {
+  let pages = tuck.library() |> tuck.add(
+    "page.txt.tuck",
+    "{{ name | endless }}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.with_filter(
+    "endless",
+    fn(_value: Json, _args: List(Json)) {
+      let _ = _spin(0)
+      Ok(JString("never"))
+    }
+  )
+  let result = process.within(2000, fn() {
+    tuck.render_named_checked(
+      pages,
+      "page.txt.tuck",
+      JObject([#("name", JString("Owl"))]),
+      limits.Budget(1000, 1000, 10000, 100000, 1000)
+    )
+  }) |> should.be_ok()
+  let problem = result |> should.be_error()
+  should.contain_text(problem.message, "reduction budget")
+}
+
+test "cancelled filters cannot send delayed results" {
+  let channel = process.channel()
+  let pages = tuck.library() |> tuck.add("page.txt.tuck", "{{ name | slow }}") |> should.be_ok()
+  let pages = pages |> tuck.with_filter(
+    "slow",
+    fn(value: Json, _args: List(Json)) {
+      time.sleep(time.milliseconds(100)) |> should.be_ok()
+      channel.send(True)
+      Ok(value)
+    }
+  )
+  let problem = tuck.render_named_checked(
+    pages,
+    "page.txt.tuck",
+    JObject([#("name", JString("Owl"))]),
+    limits.Budget(1000, 1000, 1000000, 100000, 10)
+  ) |> should.be_error()
+  should.contain_text(problem.message, "elapsed-time budget")
+  channel.receive(150) |> should.be_error()
+  Nil
+}
+
+test "deep template syntax has a bounded checked outcome" {
+  let source = string.repeat("{% if true %}", 200) + "owl" + string.repeat(
+    "{% endif %}",
+    200
+  )
+  let result = process.within(2000, fn() {
+    tuck.parse_checked(
+      "page",
+      source,
+      tuck.Escape.Html,
+      limits.Budget(20000, 1000, 10000, 100000, 500)
+    )
+  }) |> should.be_ok()
+  result |> should.be_error()
+  Nil
+}
+
+_grow(values: List(Int), size: Int) -> List(Int) {
+  match size > 100000 {
+    True -> values
+    False -> _grow(list.concat(values, values), size * 2)
+  }
+}
+
+test "heap exhaustion is reported without exhausting the caller" {
+  let result = limits.run("", limits.Budget(1, 1, 100000000, 2000, 1000), fn() {
+    _grow([1], 1)
+  })
+  should.contain_text(result |> should.be_error(), "heap budget")
+}
+
+test "invalid budgets never start the callback" {
+  let error = limits.run("", limits.Budget(0, 0, 0, 233, 1000), fn() {
+    panic ("should not run")
+  }) |> should.be_error()
+  should.contain_text(error, "resource budgets")
+}
+
+test "a crashed custom filter returns a worker failure" {
+  let pages = tuck.library() |> tuck.add("page", "{{ name | crash }}") |> should.be_ok()
+  let pages = pages |> tuck.with_filter(
+    "crash",
+    fn(_value: Json, _args: List(Json)) { panic ("deliberate failure") }
+  )
+  let error = tuck.render_named_checked(
+    pages,
+    "page",
+    JObject([#("name", JString("Owl"))]),
+    limits.defaults()
+  ) |> should.be_error()
+  should.contain_text(error.message, "worker failed")
+}
+
+test "checked folder loading applies source limits to each template" {
+  fixture.with_directory(fn(folder) {
+    file.write(path.join([folder, "page.TUCK"]), "A small template") |> should.be_ok()
+    let problem = tuck.load_checked(
+      folder,
+      limits.Budget(3, 1000, 1000000, 100000, 1000)
+    ) |> should.be_error()
+    should.equal(problem.template, "page.TUCK")
+    should.contain_text(problem.message, "source byte budget")
+    let pages = tuck.load_checked(folder, limits.defaults()) |> should.be_ok()
+    should.equal(
+      tuck.render_named(pages, "page.TUCK", JObject([])),
+      Ok("A small template")
+    )
+  })
+}

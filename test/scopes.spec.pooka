@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module scopes_test
+
+import tuck
+import pooka/json.{JObject, JString}
+import poke/should
+
+_render(source: String) -> String {
+  let page = tuck.parse(source) |> should.be_ok()
+  tuck.render(page, JObject([#("name", JString("Owl"))])) |> should.be_ok()
+}
+
+test "set introduces and replaces local values for following nodes" {
+  should.equal(
+    _render(
+      "{% set label = name | upper %}{{ label }}{% set label = \"Bird\" %}|{{ label }}"
+    ),
+    "OWL|Bird"
+  )
+}
+
+test "with bindings see the enclosing scope and do not leak" {
+  should.equal(
+    _render(
+      "{% with name = \"Bird\", original = name %}{{ name }}/{{ original }}{% endwith %}|{{ name }}"
+    ),
+    "Bird/Owl|Owl"
+  )
+}
+
+test "set inside branches and loops does not escape those scopes" {
+  should.equal(
+    _render(
+      "{% set label = \"outer\" %}{% if true %}{% set label = \"branch\" %}{{ label }}{% endif %}|{{ label }}"
+    ),
+    "branch|outer"
+  )
+}
+
+test "safe values retain their status across set and with" {
+  should.equal(
+    _render(
+      "{% set markup = \"<b>Owl</b>\" | safe %}{% with message = markup %}{{ message }}{% endwith %}"
+    ),
+    "<b>Owl</b>"
+  )
+}
+
+test "invalid bindings and stray scope tags produce parse errors" {
+  tuck.parse("{% with x=1, x=2 %}{% endwith %}") |> should.be_error()
+  tuck.parse("{% set loop = 1 %}") |> should.be_error()
+  tuck.parse("{% with x=1 %}") |> should.be_error()
+  tuck.parse("{% endwith %}") |> should.be_error()
+  Nil
+}
+
+test "include arguments override ambient values without leaking back" {
+  let pages = tuck.library() |> tuck.add(
+    "root.html.tuck",
+    "{% include \"partial.html.tuck\" with name = \"Bird\" %}|{{ name }}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add("partial.html.tuck", "{{ name }}") |> should.be_ok()
+  should.equal(
+    tuck.render_named(
+      pages,
+      "root.html.tuck",
+      JObject([#("name", JString("Owl"))])
+    ),
+    Ok("Bird|Owl")
+  )
+}
+
+test "only partials receive explicit data but retain the host registry" {
+  let pages = tuck.library() |> tuck.add(
+    "root.html.tuck",
+    "{% include \"partial.html.tuck\" with title = \"Bird\" only %}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add(
+    "partial.html.tuck",
+    "{{ title }}|{{ name | default(\"absent\") }}|{{ build.year() }}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.with_function("build.year", fn(_args) {
+    Ok(JString("2026"))
+  }) |> should.be_ok()
+  should.equal(
+    tuck.render_named(
+      pages,
+      "root.html.tuck",
+      JObject([#("name", JString("Owl"))])
+    ),
+    Ok("Bird|absent|2026")
+  )
+}
+
+test "an include-local assignment cannot change its caller" {
+  let pages = tuck.library() |> tuck.add(
+    "root.html.tuck",
+    "{% set label = \"outer\" %}{% include \"partial.html.tuck\" %}|{{ label }}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add(
+    "partial.html.tuck",
+    "{% set label = \"inner\" %}{{ label }}"
+  ) |> should.be_ok()
+  should.equal(
+    tuck.render_named(pages, "root.html.tuck", JObject([])),
+    Ok("inner|outer")
+  )
+}
+
+test "extends cannot hide inside a lexical scope" {
+  tuck.parse("{% with x=1 %}{% extends \"base\" %}{% endwith %}") |> should.be_error()
+  Nil
+}
+
+test "only with no arguments removes ambient data" {
+  let pages = tuck.library() |> tuck.add(
+    "root",
+    "{% include \"partial\" only %}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add("partial", "{{ name | default(\"absent\") }}") |> should.be_ok()
+  should.equal(
+    tuck.render_named(pages, "root", JObject([#("name", JString("Owl"))])),
+    Ok("absent")
+  )
+}
+
+test "assignments inside loop iterations cannot overwrite outer locals" {
+  let source = "{% set label = \"outer\" %}{% for bird in birds %}{% set label = bird %}{{ label }};{% endfor %}|{{ label }}"
+  let page = tuck.parse(source) |> should.be_ok()
+  let data = JObject(
+    [#("birds", json.JArray([JString("Owl"), JString("Finch")]))]
+  )
+  should.equal(tuck.render(page, data), Ok("Owl;Finch;|outer"))
+}
+
+test "missing explicit partial arguments report the caller's source location" {
+  let pages = tuck.library() |> tuck.add(
+    "root",
+    "Header\n{% include \"partial\" with title=absent only %}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add("partial", "{{ title }}") |> should.be_ok()
+  let error = tuck.render_named(pages, "root", JObject([])) |> should.be_error()
+  should.equal(error.template, "root")
+  should.equal(error.at.line, 2)
+}

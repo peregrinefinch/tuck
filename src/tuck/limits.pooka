@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Put expensive rendering in its own room. Budgets cover source size, final
+//// output size, BEAM work, worker heap, and elapsed time. Cancellation joins
+//// the worker before returning, so a timed-out filter cannot keep running.
+module limits
+
+import pooka/string
+
+/// Byte limits describe UTF-8. Heap limits use BEAM words. Work is measured in
+/// reductions, so deeply nested templates do not need a guessed nesting cost.
+class Budget(
+  max_source_bytes: Int,
+  max_output_bytes: Int,
+  max_reductions: Int,
+  max_heap_words: Int,
+  timeout_ms: Int
+)
+
+external _Worker from erlang "tuck_limits_ffi" {
+  run(work: fn() -> a, reductions: Int, heap_words: Int, timeout_ms: Int) -> Result(
+    a,
+    Int
+  )
+}
+
+/// One MiB of source, four MiB of output, twenty million reductions,
+/// four million heap words, and five seconds.
+///
+/// ```pooka
+/// assert limits.defaults().max_source_bytes == 1048576
+/// ```
+defaults() -> Budget {
+  Budget(1048576, 4194304, 20000000, 4000000, 5000)
+}
+
+/// Run a typed operation in a bounded worker. The callback's value is returned
+/// unchanged; only resource failures acquire an explanatory message.
+run(source: String, budget: Budget, work: fn() -> a) -> Result(a, String) {
+  match budget.max_source_bytes < 0 || budget.max_output_bytes < 0 || budget.max_reductions <= 0 || budget.max_heap_words < 233 || budget.timeout_ms <= 0 {
+    True -> Error(
+      "resource budgets must be positive; heap budget must be at least 233 words"
+    )
+    False -> match string.byte_size(source) > budget.max_source_bytes {
+      True -> Error("template exceeds the source byte budget")
+      False -> match _Worker.run(
+        work,
+        budget.max_reductions,
+        budget.max_heap_words,
+        budget.timeout_ms
+      ) {
+        Ok(value) -> Ok(value)
+        Error(1) -> Error("template exceeded the BEAM reduction budget")
+        Error(2) -> Error("template exceeded the worker heap budget")
+        Error(3) -> Error("template exceeded the elapsed-time budget")
+        Error(_) -> Error("the template worker failed unexpectedly")
+      }
+    }
+  }
+}
+
+/// Check the completed output inside its worker, before sending it to the
+/// caller. Interim allocations are covered by the worker's heap/work budgets.
+output(value: String, budget: Budget) -> Result(String, String) {
+  match string.byte_size(value) > budget.max_output_bytes {
+    True -> Error("rendered text exceeds the output byte budget")
+    False -> Ok(value)
+  }
+}

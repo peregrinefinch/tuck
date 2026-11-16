@@ -1,0 +1,162 @@
+//// When a template goes wrong, say where, and say it kindly.
+////
+//// Every problem Tuck reports, while reading a template or while rendering
+//// one, is a `TuckError`: the template's name, the line and column, and a
+//// sentence about what went wrong. Misspelled names come with a suggestion.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module error
+
+import pooka/int
+import pooka/list
+import pooka/string
+
+/// A place in a template: lines and columns both count from one.
+class Pos(line: Int, column: Int)
+
+/// Something wrong with a template, or with rendering it: which template,
+/// where in it, and what.
+class TuckError(template: String, at: Pos, message: String)
+
+/// The problem as one line, ready to print.
+///
+/// ```pooka
+/// import tuck/error.{Pos, TuckError}
+///
+/// let problem = TuckError("page.tuck", Pos(3, 7), "something is wrong")
+/// assert error.describe(problem) == "page.tuck:3:7: something is wrong"
+/// ```
+describe(problem: TuckError) -> String {
+  problem.template + ":" + int.to_string(problem.at.line) + ":" + int.to_string(
+    problem.at.column
+  ) + ": " + problem.message
+}
+
+/// `; did you mean `x`?` when one of the known names is close to `wanted`,
+/// or nothing at all. Close means a few edits away: one for very short
+/// names, two or more for longer ones.
+///
+/// ```pooka
+/// import tuck/error
+///
+/// assert error.suggest("uppr", ["upper", "lower"]) == "; did you mean `upper`?"
+/// assert error.suggest("zzz", ["upper"]) == ""
+/// ```
+suggest(wanted: String, known: List(String)) -> String {
+  // Swapping two letters is two edits, so names of four letters or more
+  // may be two edits away; very short names only one.
+  let length = string.length(wanted)
+  let allowed = match length < 4 {
+    True -> 1
+    False -> match int.divide(length, 3) {
+      Ok(third) -> int.max(2, third)
+      Error(_) -> 2
+    }
+  }
+  let close = list.filter_map(known, fn(name: String) {
+    let edits = distance(wanted, name)
+    match edits <= allowed && name != wanted {
+      True -> Some(#(name, edits))
+      False -> None
+    }
+  })
+  match list.sort_by(close, fn(a: #(String, Int), b: #(String, Int)) {
+    int.compare(a.1, b.1)
+  }) {
+    [best, ..] -> "; did you mean `" + best.0 + "`?"
+    [] -> ""
+  }
+}
+
+/// How many edits turn one text into the other, where an edit adds,
+/// removes or changes one character, or swaps two neighbours: `fro` is one
+/// edit from `for`.
+///
+/// ```pooka
+/// import tuck/error
+///
+/// assert error.distance("kitten", "sitting") == 3
+/// assert error.distance("fro", "for") == 1
+/// ```
+distance(from: String, to: String) -> Int {
+  let source = string.graphemes(from)
+  let target = string.graphemes(to)
+  let first = list.range(0, list.length(target) + 1)
+  let #(_, last, _) = list.index_fold(
+    source,
+    #([], first, ""),
+    fn(
+      rows: #(List(Int), List(Int), String),
+      c: String,
+      i: Int
+    ) {
+      let #(before, previous, previous_c) = rows
+      let row = _row(
+        c,
+        previous_c,
+        target,
+        "",
+        before,
+        previous,
+        [i + 1],
+        i + 1,
+        1
+      )
+      #(previous, row, c)
+    }
+  )
+  match list.last(last) {
+    Some(found) -> found
+    None -> 0
+  }
+}
+
+/// The next row of the edit-distance table. `before` is the row two back,
+/// for swaps; `j` counts the target's characters from one.
+_row(
+  c: String,
+  previous_c: String,
+  target: List(String),
+  previous_t: String,
+  before: List(Int),
+  previous: List(Int),
+  acc: List(Int),
+  left: Int,
+  j: Int
+) -> List(Int) {
+  match target {
+    [t, ..rest] -> {
+      let cost = match t == c {
+        True -> 0
+        False -> 1
+      }
+      let above = _at(previous, j)
+      let diagonal = _at(previous, j - 1)
+      let edit = int.min(int.min(above + 1, left + 1), diagonal + cost)
+      let here = match c == previous_t && previous_c == t && previous_c != "" {
+        True -> int.min(edit, _at(before, j - 2) + 1)
+        False -> edit
+      }
+      _row(
+        c,
+        previous_c,
+        rest,
+        t,
+        before,
+        previous,
+        list.prepend(acc, here),
+        here,
+        j + 1
+      )
+    }
+    [] -> list.reverse(acc)
+  }
+}
+
+_at(row: List(Int), index: Int) -> Int {
+  match list.at(row, index) {
+    Some(found) -> found
+    None -> 0
+  }
+}

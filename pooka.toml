@@ -1,0 +1,22 @@
+name = "tuck"
+version = "1.0.0"
+description = "A cozy little template engine for Pooka"
+authors = ["Peregrine Finch"]
+licences = ["Apache-2.0"]
+repository = { type = "github", user = "peregrinefinch", repo = "tuck" }
+links = [
+  { title = "Issues", href = "https://github.com/peregrinefinch/tuck/issues" },
+  { title = "Pooka", href = "https://pooka.run" },
+]
+
+[dependencies]
+pooka_json = ">= 1.0.0 and < 2.0.0"
+pooka_stdlib = ">= 0.3.1 and < 1.0.0"
+
+[dev-dependencies]
+poke = ">= 1.0.0 and < 2.0.0"
+
+[[documentation.pages]]
+title = "Tucking values into templates"
+path = "guide.html"
+source = "docs/guide.md"

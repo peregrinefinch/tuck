@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module super_test
+
+import tuck
+import pooka/json.{JObject, JString}
+import poke/should
+
+_pages() -> tuck.Library {
+  let pages = tuck.library() |> tuck.add(
+    "base.html.tuck",
+    "<main>{% block body %}<b>{{ name }}</b>{% endblock %}</main>"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add(
+    "middle.html.tuck",
+    "{% extends \"base.html.tuck\" %}{% block body %}Middle({{ super() }}){% endblock %}"
+  ) |> should.be_ok()
+  pages |> tuck.add(
+    "page.html.tuck",
+    "{% extends \"middle.html.tuck\" %}{% block body %}Page({{ super() }}){% endblock %}"
+  ) |> should.be_ok()
+}
+
+test "super traverses each ancestor and does not escape parent output twice" {
+  should.equal(
+    tuck.render_named(
+      _pages(),
+      "page.html.tuck",
+      JObject([#("name", JString("<Owl>"))])
+    ),
+    Ok("<main>Page(Middle(<b>&lt;Owl&gt;</b>))</main>")
+  )
+}
+
+test "super output can be saved without losing its safe marker" {
+  let pages = _pages() |> tuck.add(
+    "page.html.tuck",
+    "{% extends \"middle.html.tuck\" %}{% block body %}{% set parent = super() %}{{ parent }}|{{ parent }}{% endblock %}"
+  ) |> should.be_ok()
+  should.equal(
+    tuck.render_named(
+      pages,
+      "page.html.tuck",
+      JObject([#("name", JString("Owl"))])
+    ),
+    Ok("<main>Middle(<b>Owl</b>)|Middle(<b>Owl</b>)</main>")
+  )
+}
+
+test "super outside a parent block returns a helpful error" {
+  let page = tuck.parse("{{ super() }}") |> should.be_ok()
+  should.contain_text(
+    (tuck.render(page, JObject([])) |> should.be_error()).message,
+    "no parent block"
+  )
+}
+
+test "super does not accept arguments" {
+  let pages = _pages() |> tuck.add(
+    "page.html.tuck",
+    "{% extends \"base.html.tuck\" %}{% block body %}{{ super(1) }}{% endblock %}"
+  ) |> should.be_ok()
+  should.contain_text(
+    (
+      tuck.render_named(pages, "page.html.tuck", JObject([])) |> should.be_error()
+    ).message,
+    "does not take arguments"
+  )
+}
+
+test "includes cannot borrow their caller's super chain" {
+  let pages = _pages() |> tuck.add(
+    "page.html.tuck",
+    "{% extends \"base.html.tuck\" %}{% block body %}{% include \"partial.html.tuck\" %}{% endblock %}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add("partial.html.tuck", "{{ super() }}") |> should.be_ok()
+  should.contain_text(
+    (
+      tuck.render_named(pages, "page.html.tuck", JObject([])) |> should.be_error()
+    ).message,
+    "no parent block"
+  )
+}
+
+test "rendering a partial does not consume the enclosing super chain" {
+  let pages = _pages() |> tuck.add(
+    "page.html.tuck",
+    "{% extends \"base.html.tuck\" %}{% block body %}{% include \"partial\" %}{{ super() }}{% endblock %}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add("partial", "A visitor: ") |> should.be_ok()
+  should.equal(
+    tuck.render_named(
+      pages,
+      "page.html.tuck",
+      JObject([#("name", JString("Owl"))])
+    ),
+    Ok("<main>A visitor: <b>Owl</b></main>")
+  )
+}

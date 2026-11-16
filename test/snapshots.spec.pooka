@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module snapshots_test
+
+import tuck
+import pooka/json.{JArray, JBool, JObject, JString}
+import poke/should
+import poke/snapshot
+
+test "an inherited HTML page keeps its rendered snapshot" {
+  let pages = tuck.library() |> tuck.add(
+    "base.html.tuck",
+    "<!doctype html>\n<title>{% block title %}Reading room{% endblock %}</title>\n<main>{% block body %}{% endblock %}</main>\n"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add(
+    "page.html.tuck",
+    "{% extends \"base.html.tuck\" %}{% block title %}{{ title }}{% endblock %}{% block body %}<ul>{% for book in books %}{% include \"book.txt.tuck\" %}{% else %}<li>No books yet.</li>{% endfor %}</ul>{% endblock %}"
+  ) |> should.be_ok()
+  let pages = pages |> tuck.add(
+    "book.txt.tuck",
+    "<li>{{ loop.index }}. {{ book.title }}{% if book.available %} — available{% endif %}</li>"
+  ) |> should.be_ok()
+  let data = JObject(
+    [
+      #("title", JString("Owl & friends")),
+      #(
+        "books",
+        JArray(
+          [
+            JObject(
+              [
+                #("title", JString("<Night flights>")),
+                #("available", JBool(True))
+              ]
+            ),
+            JObject(
+              [
+                #("title", JString("A quiet branch")),
+                #("available", JBool(False))
+              ]
+            )
+          ]
+        )
+      )
+    ]
+  )
+  let output = tuck.render_named(pages, "page.html.tuck", data) |> should.be_ok()
+  snapshot.snap(output, "reading-room-page")
+}
+
+test "helpful diagnostics keep their snapshot" {
+  let template = tuck.parse_named(
+    "home.html.tuck",
+    "Welcome\n{{ user.emial }}",
+    tuck.Escape.Html
+  ) |> should.be_ok()
+  let data = JObject(
+    [#("user", JObject([#("email", JString("owl@example.com"))]))]
+  )
+  let error = tuck.render(template, data) |> should.be_error()
+  snapshot.snap(tuck.describe(error) + "\n", "missing-field")
+}

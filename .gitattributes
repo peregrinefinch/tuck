@@ -1,0 +1,2 @@
+* text=auto eol=lf
+test/snapshots/*.accepted -text -whitespace

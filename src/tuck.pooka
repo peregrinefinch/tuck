@@ -1,0 +1,458 @@
+//// A cozy little template engine: tuck your values into text.
+////
+//// Tuck reads templates with `{{ values }}`, `{% if %}`, `{% for %}`,
+//// includes and inheritance, and renders them with data from `pooka/json`.
+//// Templates meant for HTML escape what they print, so a name like
+//// `<script>` arrives as text, not as a surprise.
+////
+//// ```pooka
+//// import pooka/json.{JObject, JString}
+//// import tuck
+////
+//// let assert Ok(page) = tuck.parse("Hello, {{ name }}!")
+//// let data = JObject([#("name", JString("Ada"))])
+//// assert tuck.render(page, data) == Ok("Hello, Ada!")
+//// ```
+////
+//// For more than one template, put them in a `Library`: it reads each one
+//// once, lets them include and extend each other, and renders them by name.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module tuck
+
+import pooka/file
+import pooka/dict
+import pooka/json.{JObject, Json}
+import pooka/list
+import pooka/path
+import pooka/string
+import tuck/ast.{Document}
+import tuck/error.{Pos, TuckError}
+import tuck/filter.{Filter}
+import tuck/lexer
+import tuck/limits
+import tuck/function.{Function}
+import tuck/parser
+import tuck/render as renderer
+
+/// How printed values are made safe.
+///
+/// - `Html`: `&`, `<`, `>`, `"` and `'` become entities. The default.
+/// - `Plain`: values are printed exactly as they are, for text, Markdown or
+///   email bodies.
+enum Escape {
+  Html,
+  Plain
+}
+
+/// A template that has been read and checked, ready to render.
+class Template(name: String, escape: Escape, document: Document)
+
+/// Templates that can include and extend each other, each read once, with
+/// custom filters and explicitly registered host functions.
+class Library(
+  templates: List(#(String, Template)),
+  filters: List(#(String, Filter)),
+  functions: List(#(String, Function))
+)
+
+/// Read a template from text. It is called `template` in error messages,
+/// and escapes for HTML.
+///
+/// ```pooka
+/// import tuck
+///
+/// let assert Error(problem) = tuck.parse("{% if %}")
+/// assert tuck.describe(problem) == "template:1:7: expected a value, found `%}`"
+/// ```
+parse(source: String) -> Result(Template, TuckError) {
+  parse_named("template", source, Escape.Html)
+}
+
+/// Read a template from text, with the name its errors will use and how it
+/// escapes.
+parse_named(name: String, source: String, escape: Escape) -> Result(
+  Template,
+  TuckError
+) {
+  let lexemes = lexer.lex(name, source)?
+  let document = parser.parse(name, lexemes)?
+  Ok(Template(name, escape, document))
+}
+
+/// Render a template on its own. `data` must be an object; its fields are
+/// the template's names. A template that includes or extends others needs a
+/// `Library`.
+///
+/// ```pooka
+/// import pooka/json.{JArray, JObject, JString}
+/// import tuck
+///
+/// let assert Ok(list) = tuck.parse("{% for n in names %}{{ n }};{% endfor %}")
+/// let data = JObject([#("names", JArray([JString("Ada"), JString("Bo")]))])
+/// assert tuck.render(list, data) == Ok("Ada;Bo;")
+/// ```
+render(template: Template, data: Json) -> Result(String, TuckError) {
+  let own = template.name
+  _render(
+    template,
+    fn(name: String) {
+      match name == own {
+        True -> Ok(template.document)
+        False -> Error(TuckError(
+          own,
+          Pos(1, 1),
+          "cannot find `" + name + "`: a template rendered on its own cannot include or extend others; put them in a `tuck.Library`"
+        ))
+      }
+    },
+    [],
+    [],
+    data
+  )
+}
+
+// --- libraries -------------------------------------------------------------------
+
+/// A library with no templates yet.
+library() -> Library {
+  Library([], [], [])
+}
+
+/// Add a template to a library, read from text. Names ending in
+/// `.html.tuck`, `.htm.tuck`, `.xml.tuck` or `.svg.tuck` escape for HTML;
+/// others print values as they are.
+///
+/// ```pooka
+/// import tuck
+///
+/// let assert Ok(pages) = tuck.library()
+///   |> tuck.add("base.html.tuck", "<main>{% block body %}{% endblock %}</main>")
+/// ```
+add(library: Library, name: String, source: String) -> Result(
+  Library,
+  TuckError
+) {
+  let template = parse_named(name, source, escape_for(name))?
+  Ok(Library(
+    list.append(
+      list.filter(library.templates, fn(entry: #(String, Template)) {
+        entry.0 != name
+      }),
+      #(name, template)
+    ),
+    library.filters,
+    library.functions
+  ))
+}
+
+/// Read every `.tuck` file in a folder and its subfolders. Each template is
+/// named by its path inside the folder, with `/` between the parts:
+/// `layouts/base.html.tuck`.
+load(folder: String) -> Result(Library, TuckError) {
+  _load(folder, None)
+}
+
+_load(folder: String, budget: Option(limits.Budget)) -> Result(
+  Library,
+  TuckError
+) {
+  let files = _tuck_files(folder, "")?
+  list.try_fold(files, library(), fn(found: Library, name: String) {
+    let source = match file.read(path.join([folder, name])) {
+      Ok(text) -> Ok(text)
+      Error(problem) -> Error(
+        TuckError(name, Pos(1, 1), "cannot read the file: " + problem.message)
+      )
+    }?
+    let _ = match budget {
+      Some(selected) if string.byte_size(source) > selected.max_source_bytes -> Error(
+        TuckError(name, Pos(1, 1), "template exceeds the source byte budget")
+      )
+      _ -> Ok(Nil)
+    }?
+    add(found, name, source)
+  })
+}
+
+_tuck_files(folder: String, prefix: String) -> Result(List(String), TuckError) {
+  let here = path.join([folder, prefix])
+  let names = match file.list_directory(here) {
+    Ok(found) -> Ok(list.sort(found))
+    Error(problem) -> Error(TuckError(
+      here,
+      Pos(1, 1),
+      "cannot read the folder: " + problem.message
+    ))
+  }?
+  list.try_fold(names, [], fn(acc: List(String), entry: String) {
+    let relative = match prefix {
+      "" -> entry
+      _ -> prefix + "/" + entry
+    }
+    match file.is_directory(path.join([folder, relative])) {
+      Ok(True) -> {
+        let inside = _tuck_files(folder, relative)?
+        Ok(list.concat(acc, inside))
+      }
+      _ -> match string.ends_with(string.lowercase(entry), ".tuck") {
+        True -> Ok(list.append(acc, relative))
+        False -> Ok(acc)
+      }
+    }
+  })
+}
+
+/// Add a filter of your own. It receives the value and any arguments, and
+/// returns the new value or a sentence about what went wrong.
+///
+/// ```pooka
+/// import pooka/json.{JString, Json}
+/// import tuck
+///
+/// let shout = fn(value: Json, _args: List(Json)) {
+///   match value {
+///     JString(s) -> Ok(JString(s + "!"))
+///     _ -> Error("`shout` needs text")
+///   }
+/// }
+/// let pages = tuck.library() |> tuck.with_filter("shout", shout)
+/// ```
+with_filter(
+  library: Library,
+  name: String,
+  run: fn(Json, List(Json)) -> Result(Json, String)
+) -> Library {
+  Library(
+    library.templates,
+    list.prepend(
+      list.filter(library.filters, fn(entry: #(String, Filter)) {
+        entry.0 != name
+      }),
+      #(name, Filter(run))
+    ),
+    library.functions
+  )
+}
+
+/// The template called `name`, if the library has it.
+template(library: Library, name: String) -> Option(Template) {
+  list.key_find(library.templates, name)
+}
+
+/// Render the library's template called `name`.
+///
+/// ```pooka
+/// import pooka/json.{JObject, JString}
+/// import tuck
+///
+/// let assert Ok(pages) = tuck.library()
+///   |> tuck.add("base.html.tuck", "<main>{% block body %}{% endblock %}</main>")
+/// let assert Ok(pages) = pages
+///   |> tuck.add("home.html.tuck", "{% extends \"base.html.tuck\" %}{% block body %}Hi, {{ name }}{% endblock %}")
+/// let data = JObject([#("name", JString("<Ada>"))])
+/// assert tuck.render_named(pages, "home.html.tuck", data) == Ok("<main>Hi, &lt;Ada&gt;</main>")
+/// ```
+render_named(library: Library, name: String, data: Json) -> Result(
+  String,
+  TuckError
+) {
+  // A render may visit an include many times inside a loop. Build the lookup
+  // once, retaining the first entry if a Library was constructed directly.
+  let indexed = dict.from_list(list.reverse(library.templates))
+  let chosen = match indexed.get(name) {
+    Some(found) -> Ok(found)
+    None -> Error(TuckError(
+      name,
+      Pos(1, 1),
+      "there is no template called `" + name + "`" + error.suggest(
+        name,
+        list.map(library.templates, fn(entry: #(String, Template)) { entry.0 })
+      )
+    ))
+  }?
+  _render(
+    chosen,
+    fn(wanted: String) {
+      match indexed.get(wanted) {
+        Some(found) -> Ok(found.document)
+        None -> Error(TuckError(
+          wanted,
+          Pos(1, 1),
+          "there is no template called `" + wanted + "`" + error.suggest(
+            wanted,
+            list.map(library.templates, fn(entry: #(String, Template)) {
+              entry.0
+            })
+          )
+        ))
+      }
+    },
+    library.filters,
+    library.functions,
+    data
+  )
+}
+
+/// How a template named `name` escapes: `Html` for HTML, XML and SVG
+/// templates, `Plain` for anything else.
+///
+/// ```pooka
+/// import tuck
+///
+/// assert tuck.escape_for("pages/home.html.tuck") == tuck.Escape.Html
+/// assert tuck.escape_for("emails/welcome.txt.tuck") == tuck.Escape.Plain
+/// ```
+escape_for(name: String) -> Escape {
+  let markup = list.any(
+    [".html.tuck", ".htm.tuck", ".xml.tuck", ".svg.tuck"],
+    fn(
+      ending: String
+    ) {
+      string.ends_with(string.lowercase(name), ending)
+    }
+  )
+  match markup {
+    True -> Escape.Html
+    False -> Escape.Plain
+  }
+}
+
+/// A problem as one line: `name:line:column: what went wrong`.
+describe(problem: TuckError) -> String {
+  error.describe(problem)
+}
+
+_render(
+  template: Template,
+  load: fn(String) -> Result(Document, TuckError),
+  filters: List(#(String, Filter)),
+  functions: List(#(String, Function)),
+  data: Json
+) -> Result(String, TuckError) {
+  let fields = match data {
+    JObject(entries) -> Ok(entries)
+    other -> Error(TuckError(
+      template.name,
+      Pos(1, 1),
+      "the data must be an object, so its fields can be named; this is " + filter.kind(
+        other
+      )
+    ))
+  }?
+  renderer.document(
+    template.name,
+    load,
+    filters,
+    functions,
+    template.escape == Escape.Html,
+    fields
+  )
+}
+
+/// Read a named template in a resource-bounded worker. Parser errors retain
+/// their exact location; resource failures name the entry point at line one.
+///
+/// ```pooka
+/// let page = tuck.parse_checked("home.html.tuck", "Hi, {{ name }}", tuck.Escape.Html, limits.defaults())
+/// ```
+parse_checked(
+  name: String,
+  source: String,
+  escape: Escape,
+  budget: limits.Budget
+) -> Result(Template, TuckError) {
+  _checked(name, source, budget, fn() { parse_named(name, source, escape) })
+}
+
+/// Render a parsed template with bounded work, heap, time and final output.
+///
+/// ```pooka
+/// let assert Ok(page) = tuck.parse("Hello")
+/// assert tuck.render_checked(page, json.JObject([]), limits.defaults()) == Ok("Hello")
+/// ```
+render_checked(template: Template, data: Json, budget: limits.Budget) -> Result(
+  String,
+  TuckError
+) {
+  _checked(template.name, "", budget, fn() {
+    let text = render(template, data)?
+    _bounded_output(template.name, text, budget)
+  })
+}
+
+/// Render a library entry with the same resource boundary, including includes,
+/// inheritance, custom filters, and output generation.
+render_named_checked(
+  library: Library,
+  name: String,
+  data: Json,
+  budget: limits.Budget
+) -> Result(String, TuckError) {
+  _checked(name, "", budget, fn() {
+    let text = render_named(library, name, data)?
+    _bounded_output(name, text, budget)
+  })
+}
+
+_checked(
+  name: String,
+  source: String,
+  budget: limits.Budget,
+  work: fn() -> Result(a, TuckError)
+) -> Result(a, TuckError) {
+  match limits.run(source, budget, work) {
+    Ok(result) -> result
+    Error(message) -> Error(TuckError(name, Pos(1, 1), message))
+  }
+}
+
+_bounded_output(name: String, text: String, budget: limits.Budget) -> Result(
+  String,
+  TuckError
+) {
+  match limits.output(text, budget) {
+    Ok(text) -> Ok(text)
+    Error(message) -> Error(TuckError(name, Pos(1, 1), message))
+  }
+}
+
+/// Load a folder within a resource budget. The source-byte budget applies to
+/// each template; the work, heap and time budgets cover the whole operation.
+load_checked(folder: String, budget: limits.Budget) -> Result(
+  Library,
+  TuckError
+) {
+  _checked(folder, "", budget, fn() { _load(folder, Some(budget)) })
+}
+
+/// Register an explicitly callable host function. Dotted names form namespaces;
+/// callbacks return ordinary typed JSON data and therefore retain autoescaping.
+///
+/// ```pooka
+/// let clock = fn(args) { match args { [] -> Ok(json.JString("2026-11-16")) _ -> Error("expected no arguments") } }
+/// let pages = tuck.with_function(tuck.library(), "time.now", clock)
+/// ```
+with_function(
+  library: Library,
+  name: String,
+  run: fn(List(Json)) -> Result(Json, String)
+) -> Result(Library, TuckError) {
+  match function.valid_name(name) {
+    False -> Error(
+      TuckError(
+        "functions",
+        Pos(1, 1),
+        "invalid function name `" + name + "`; use identifiers such as `time.now` (`super` is reserved)"
+      )
+    )
+    True -> {
+      let functions = [
+        #(name, Function(run)),
+        ..list.filter(library.functions, fn(entry) { entry.0 != name })
+      ]
+      Ok(Library(library.templates, library.filters, functions))
+    }
+  }
+}
