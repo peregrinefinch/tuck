@@ -1,5 +1,5 @@
 name = "tuck"
-version = "1.0.0"
+version = "1.1.0"
 description = "A cozy little template engine for Pooka"
 authors = ["Peregrine Finch"]
 licences = ["Apache-2.0"]
